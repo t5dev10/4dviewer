@@ -24,7 +24,7 @@ export async function validateFile(file, { name } = {}) {
   if (!format) {
     return {
       ok: false, format: null, bytes: size, metadata: null, warnings,
-      reason: `Unrecognised file. Supported: .nx4d, .nxs4, .ply, .spz, .sog, .gltf/.glb, .splat, .ksplat, .usdz (the name suggests ${byName ?? 'nothing'} and the first bytes suggest ${byBytes ?? 'nothing'}).`,
+      reason: `Unrecognised file. Supported: .nx4d, .nxs4, .ply, .sog4d, .spz, .sog, .gltf/.glb, .splat, .ksplat, .usdz (the name suggests ${byName ?? 'nothing'} and the first bytes suggest ${byBytes ?? 'nothing'}).`,
     };
   }
   if (byName && byBytes && !formatsAgree(byName, byBytes) && byName !== format) {
@@ -47,6 +47,9 @@ async function probe(format, file, head, warnings) {
     case 'nx4d': return probeNx4d(head, warnings);
     case 'spz': return probeSpz(head, warnings);
     case 'ply': return probePly(head, file, warnings);
+    case 'sog4d':
+      if (!(head[0] === 0x50 && head[1] === 0x4b)) throw new Error('a .sog4d file is a ZIP archive, and this one is not');
+      return { kind: 'temporal', note: 'SOG4D metadata lives inside the archive and is checked on load.' };
     case 'sog':
       warnings.push(STATIC_NOTE('SOG'));
       return { kind: 'static', note: 'SOG metadata lives inside the archive and is checked on load.' };

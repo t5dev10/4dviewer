@@ -23,6 +23,7 @@ import { subscribeFrames } from '../core/frame-driver.js';
 import { runWorkerJob } from '../core/workers.js';
 import { validateFile } from '../core/validate.js';
 import { WebGLSplatRenderer } from '../render/webgl-renderer.js';
+import { sortInitMessage, sortPoses, sortWindow } from '../render/sort-protocol.js';
 import { sliceAt } from '../export/slice.js';
 import { sceneToGLB, sceneToPLY } from '../export/writers.js';
 
@@ -90,7 +91,7 @@ export function mountViewer(root, options = {}) {
     cam: defaultOrbit(), camOverride: null, camLimits: null, fov: cfg.fov || DEFAULT_FOV,
     xf: cloneXf(cfg.xf || IDENTITY_XF), xfFromUrl: !!cfg.xf,
     glRenderer: null, gpuRenderer: null, usingGpu: false, webgpuDead: false,
-    sortWorker: null, sortGen: 0, sortInFlight: false, sortEpoch: 0, sortSentAt: 0, sortRtt: 0,
+    sortWorker: null, sortGen: 0, sortInFlight: false, sortEpoch: 0, sortSentAt: 0, sortRtt: 0, orderT: NaN,
     lastFrameKey: '', lastSortKey: '', lastStatsAt: 0, showStats: query.get('stats') === '1',
     caps: null, manifest: null, activeSceneId: null, sceneName: '', credit: '', localFile: null,
     stream: null, streamController: null, audio: null, xr: null, qualityTier: 'auto',
@@ -276,6 +277,7 @@ export function mountViewer(root, options = {}) {
     const rtt = (performance.now() - state.sortSentAt) / 1000;
     state.sortRtt = state.sortRtt ? 0.8 * state.sortRtt + 0.2 * rtt : rtt;
     state.sortEpoch++;
+    state.orderT = Number.isFinite(e.data.t) ? e.data.t : NaN;
     state.glRenderer?.updateOrder(e.data.indices);
     if (e.data.indices.length > 0) state.streamController?.markFirstPaint();
   }
@@ -286,17 +288,26 @@ export function mountViewer(root, options = {}) {
       ? new Worker(new URL('../render/sort-worker-temporal.js', import.meta.url), { type: 'module' })
       : new Worker(new URL('../render/sort-worker-static.js', import.meta.url), { type: 'module' });
     w.onmessage = onSorted;
-    if (kind === 'temporal' && state.temporalScene && !state.temporalScene.streaming) {
-      const geo = state.temporalScene.geo.slice();
-      w.postMessage({ geo, count: state.temporalScene.count, duration: state.temporalScene.duration }, [geo.buffer]);
-    } else if (kind === 'static') {
-      const s = state.staticScene;
-      const positions = s.positions.slice(), opacities = s.opacities.slice(), scales = s.scales.slice();
-      w.postMessage({ positions, count: s.count, opacities, scales }, [positions.buffer, opacities.buffer, scales.buffer]);
+    const scene = kind === 'temporal' ? state.temporalScene : state.staticScene;
+    if (scene && !scene.streaming) {
+      const { msg, transfer } = sortInitMessage(scene);
+      w.postMessage(msg, transfer);
     }
     state.sortWorker = w;
     state.lastSortKey = '';
+    state.orderT = NaN;
     return w;
+  }
+
+  // A sorted order only lists the splats alive near the time it was computed
+  // for; after a jump (seek, scrub, loop) keep drawing that time until the
+  // order for the new one arrives, rather than drawing a list with holes.
+  function drawTime() {
+    const scene = state.temporalScene;
+    if (state.kind !== 'temporal' || !scene || scene.streaming || !Number.isFinite(state.orderT)) return state.t;
+    const d = scene.duration;
+    const gap = Math.abs(state.t - state.orderT);
+    return Math.min(gap, d - gap) > 2 * sortWindow(state.sortRtt) ? state.orderT : state.t;
   }
 
   // --- renderers --------------------------------------------------------------------
@@ -335,7 +346,9 @@ export function mountViewer(root, options = {}) {
     alive();
     state.usingGpu = false;
     const scene = state.kind === 'temporal' ? state.temporalScene : state.staticScene;
-    if (state.caps?.webgpu && !state.webgpuDead && cfg.gpu === '1') {
+    // The WebGPU path (opt-in) draws the plain nx4d model only.
+    const plain = scene.kind !== 'temporal' || (scene.staticRule !== false && !scene.ext && !scene.groups);
+    if (state.caps?.webgpu && !state.webgpuDead && cfg.gpu === '1' && plain) {
       try {
         const { WebGPUSplatRenderer } = await import('../render/webgpu-renderer.js');
         const r = await WebGPUSplatRenderer.create(els.gpu, scene, { maxShDegree: uploadOptions().maxShDegree });
@@ -473,11 +486,11 @@ export function mountViewer(root, options = {}) {
         state.sortSentAt = performance.now();
         state.sortWorker.postMessage({
           view: Array.from(view.m), t: state.t, gen: ++state.sortGen, cap: quality.splatCap || 0,
-          window: (state.sortRtt || 0) + 1 / 30,
+          window: sortWindow(state.sortRtt), poses: sortPoses(state.temporalScene, state.t),
         });
       }
       r.grow = state.grow;
-      r.time = state.t;
+      r.time = drawTime();
       r.clear();
       r.render(view.m, { fx: f, fy: f, cx: W / 2, cy: H / 2 }, { x: 0, y: 0, width: W, height: H }, view.eyeLocal);
       drawn = state.temporalScene?.streaming ? state.temporalScene.count : r.count;

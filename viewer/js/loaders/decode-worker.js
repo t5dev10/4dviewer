@@ -4,6 +4,7 @@
 import { loadPly } from './ply.js';
 import { loadSpz } from './spz.js';
 import { loadSog } from './sog.js';
+import { loadSog4d } from './sog4d.js';
 import { loadGltf } from './gltf.js';
 import { loadSplat } from './splat.js';
 import { loadKsplat } from './ksplat.js';
@@ -19,6 +20,7 @@ async function decode({ buffer, format, sourceUrl, up }) {
     case 'ply': return loadPly(buffer);
     case 'spz': return loadSpz(buffer);
     case 'sog': return loadSog(buffer, sourceUrl);
+    case 'sog4d': return loadSog4d(buffer);
     case 'gltf': return loadGltf(buffer, sourceUrl);
     case 'splat': return loadSplat(buffer);
     case 'ksplat': return loadKsplat(buffer);

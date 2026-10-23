@@ -4,6 +4,9 @@
 
 import { halfTable } from '../core/half.js';
 import { makeStaticScene, SH_C0, isStaticSplat } from '../core/scene.js';
+import { groupPosesAt, poseMatrix, POSE_STRIDE } from '../core/groups.js';
+import { shRotationMatrices } from '../core/sh.js';
+import { EXT_STRIDE } from '../core/temporal-build.js';
 
 // Jacobi eigen-decomposition of a symmetric 3x3 [xx xy xz yy yz zz].
 function eigenSym(s, values, vectors) {
@@ -63,19 +66,53 @@ function matToQuat(m, q) {
   for (let k = 0; k < 4; ++k) q[k] /= l;
 }
 
+// Σ' = R Σ Rᵀ on the upper triangle (xx xy xz yy yz zz), R row-major.
+function rotateCov(R, s) {
+  const m = [[s[0], s[1], s[2]], [s[1], s[3], s[4]], [s[2], s[4], s[5]]];
+  const a = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  for (let i = 0; i < 3; ++i) {
+    for (let j = 0; j < 3; ++j) {
+      let v = 0;
+      for (let k = 0; k < 3; ++k) v += R[i * 3 + k] * m[k][j];
+      a[i][j] = v;
+    }
+  }
+  const out = (i, j) => a[i][0] * R[j * 3] + a[i][1] * R[j * 3 + 1] + a[i][2] * R[j * 3 + 2];
+  s[0] = out(0, 0); s[1] = out(0, 1); s[2] = out(0, 2); s[3] = out(1, 1); s[4] = out(1, 2); s[5] = out(2, 2);
+}
+
 export function sliceAt(scene, t, cut = 1 / 255) {
   const { count, geo, sht, shF, shB, duration } = scene;
+  const ext = scene.ext || null;
+  const ruled = scene.staticRule !== false;
   const half = halfTable();
   const K = shB - 1;
   const keep = new Int32Array(count);
+  cut = Math.max(cut, scene.alphaCut || 0);
   let n = 0;
   for (let i = 0; i < count; ++i) {
     const g = i * 16;
+    if (ext && (t < ext[i * EXT_STRIDE] || t >= ext[i * EXT_STRIDE + 1])) {
+      keep[i] = -1;
+      continue;
+    }
     const dt = t - geo[g + 3];
-    const still = isStaticSplat(geo[g + 7], duration);
+    const still = ruled && isStaticSplat(geo[g + 7], duration);
     const a = geo[g + 14] * (still ? 1 : Math.exp(-dt * dt * geo[g + 7]));
     keep[i] = a >= cut ? n++ : -1;
   }
+  // Rigid groups: pose at t for positions and Σ, and per-group SH rotations.
+  const poses = scene.groups ? groupPosesAt(scene.groups, t) : null;
+  const rotOf = new Map();
+  const groupRot = (grp) => {
+    let r = rotOf.get(grp);
+    if (!r) {
+      const R = poseMatrix(poses, grp);
+      r = { R, bands: K ? shRotationMatrices(Array.from(R)) : null };
+      rotOf.set(grp, r);
+    }
+    return r;
+  };
   const positions = new Float32Array(n * 3);
   const scales = new Float32Array(n * 3);
   const rotations = new Float32Array(n * 4);
@@ -87,17 +124,29 @@ export function sliceAt(scene, t, cut = 1 / 255) {
   const q = [1, 0, 0, 0];
   const s6 = [0, 0, 0, 0, 0, 0];
   const coef = new Float64Array(shB * 3);
+  const tmp = new Float64Array(7);
   for (let i = 0; i < count; ++i) {
     const o = keep[i];
     if (o < 0) continue;
     const g = i * 16;
     const dt = t - geo[g + 3];
-    const still = isStaticSplat(geo[g + 7], duration);
-    positions[o * 3] = geo[g] + geo[g + 4] * dt;
-    positions[o * 3 + 1] = geo[g + 1] + geo[g + 5] * dt;
-    positions[o * 3 + 2] = geo[g + 2] + geo[g + 6] * dt;
-    opacities[o] = geo[g + 14] * (still ? 1 : Math.exp(-dt * dt * geo[g + 7]));
+    const still = ruled && isStaticSplat(geo[g + 7], duration);
+    let px = geo[g] + geo[g + 4] * dt, py = geo[g + 1] + geo[g + 5] * dt, pz = geo[g + 2] + geo[g + 6] * dt;
     for (let k = 0; k < 6; ++k) s6[k] = geo[g + 8 + k];
+    const grp = poses && ext ? Math.floor(ext[i * EXT_STRIDE + 2] + 0.5) : -1;
+    const gr = grp >= 0 && grp < scene.groups.count ? groupRot(grp) : null;
+    if (gr) {
+      const R = gr.R, o8 = grp * POSE_STRIDE;
+      const x = R[0] * px + R[1] * py + R[2] * pz + poses[o8 + 4];
+      const y = R[3] * px + R[4] * py + R[5] * pz + poses[o8 + 5];
+      const z = R[6] * px + R[7] * py + R[8] * pz + poses[o8 + 6];
+      px = x; py = y; pz = z;
+      rotateCov(R, s6);
+    }
+    positions[o * 3] = px;
+    positions[o * 3 + 1] = py;
+    positions[o * 3 + 2] = pz;
+    opacities[o] = geo[g + 14] * (still ? 1 : Math.exp(-dt * dt * geo[g + 7]));
     eigenSym(s6, vals, vecs);
     matToQuat(vecs, q);
     rotations.set(q, o * 4);
@@ -111,6 +160,19 @@ export function sliceAt(scene, t, cut = 1 / 255) {
       const phi = f === 0 ? 1 : Math.cos((2 * Math.PI * f * dt) / duration);
       const row = base + f * shB * 3;
       for (let b = 0; b < shB * 3; ++b) coef[b] += phi * half[sht[row + b]];
+    }
+    if (gr?.bands) {
+      for (let l = 1; l * l < shB; ++l) {
+        const nb = 2 * l + 1, off = l * l, M = gr.bands[l - 1];
+        for (let c = 0; c < 3; ++c) {
+          for (let r = 0; r < nb; ++r) {
+            let s = 0;
+            for (let k = 0; k < nb; ++k) s += M[r * nb + k] * coef[(off + k) * 3 + c];
+            tmp[r] = s;
+          }
+          for (let r = 0; r < nb; ++r) coef[(off + r) * 3 + c] = tmp[r];
+        }
+      }
     }
     for (let c = 0; c < 3; ++c) {
       colorsDC[o * 3 + c] = SH_C0 * coef[c];

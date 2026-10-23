@@ -6,10 +6,12 @@ import { VERTEX, FRAGMENT, MAX_FOURIER } from './shaders.js';
 import { floatToHalfFast } from '../core/half.js';
 import { SH_C0 } from '../core/scene.js';
 import { transposeToColumnMajor } from '../core/camera.js';
+import { groupPosesAt, POSE_STRIDE } from '../core/groups.js';
+import { ALPHA_CUT, EXT_STRIDE } from '../core/temporal-build.js';
 
 const UNIFORMS = ['uView', 'uViewport', 'uFocal', 'uPrincipal', 'uCamPos', 'uMaxRadius', 'uGrow', 'uRevealOrigin',
-  'uRevealInvRadius', 'uRevealWidth', 'uT', 'uDuration', 'uShF', 'uShB', 'uShStride', 'uMotion', 'uTexWidth',
-  'uT0', 'uT1', 'uT2', 'uT3', 'uTC', 'uOrder'];
+  'uRevealInvRadius', 'uRevealWidth', 'uT', 'uDuration', 'uShF', 'uShB', 'uShStride', 'uMotion', 'uStaticRule',
+  'uAlphaCut', 'uExt', 'uGroupCount', 'uTexWidth', 'uT0', 'uT1', 'uT2', 'uT3', 'uT4', 'uGroups', 'uTC', 'uOrder'];
 const BAND_TEXELS = 1 << 20;
 const BAND_STEPS = [16, 9, 4, 1];
 
@@ -106,6 +108,12 @@ export class WebGLSplatRenderer {
     this.revealInvRadius = 0;
     this.revealWidth = 0;
     this.poolInfo = null;
+    this.staticRule = true;
+    this.alphaCut = ALPHA_CUT;
+    this.hasExt = false;
+    this.groupTrack = null;
+    this.groupPoses = null;
+    this.posesTime = NaN;
     this.tex = {};
   }
 
@@ -259,6 +267,12 @@ export class WebGLSplatRenderer {
     this.uploadOpts = opts;
     this.count = scene.count;
     this.mode = scene.kind;
+    this.staticRule = scene.kind !== 'temporal' || scene.staticRule !== false;
+    this.alphaCut = Math.max(ALPHA_CUT, scene.alphaCut ?? ALPHA_CUT);
+    this.hasExt = false;
+    this.groupTrack = null;
+    this.groupPoses = null;
+    this.posesTime = NaN;
     if (scene.count === 0) return;
     if (scene.kind === 'temporal') this._uploadTemporal(scene, opts);
     else this._uploadStatic(scene, opts);
@@ -297,6 +311,30 @@ export class WebGLSplatRenderer {
         stage[j * 4 + 2] = sht[src + 2];
       }
     });
+    if (scene.ext) {
+      this.tex.t4 = this._tex2D(gl.RGBA32F, w, h);
+      this._uploadBands(this.tex.t4, n, (stage, first, cnt) => {
+        stage.set(scene.ext.subarray(first * EXT_STRIDE, (first + cnt) * EXT_STRIDE));
+      });
+      this.hasExt = true;
+    }
+    if (scene.groups) {
+      const G = scene.groups.count;
+      if (G > this.maxTextureSize) throw new Error(`webgl-renderer: ${G} rigid groups exceed this GPU's texture limit`);
+      this.tex.groups = this._tex2D(gl.RGBA32F, 2, G);
+      this.groupTrack = scene.groups;
+      this.groupPoses = new Float32Array(G * POSE_STRIDE);
+    }
+  }
+
+  // Group poses follow the clock: re-evaluated whenever the time moves.
+  _syncGroups() {
+    if (!this.groupTrack || this.posesTime === this.time) return;
+    groupPosesAt(this.groupTrack, this.time, this.groupPoses);
+    this.posesTime = this.time;
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, this.tex.groups);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 2, this.groupTrack.count, gl.RGBA, gl.FLOAT, this.groupPoses, 0);
   }
 
   _uploadStatic(scene, opts) {
@@ -375,6 +413,10 @@ export class WebGLSplatRenderer {
     this.scene = null;
     this.mode = 'temporal';
     this.duration = duration;
+    this.staticRule = true;
+    this.alphaCut = ALPHA_CUT;
+    this.hasExt = false;
+    this.groupTrack = null;
     const W = Math.min(this.maxTextureSize, 4096);
     const rows = Math.max(1, Math.min(Math.ceil(capacity / W), this.maxTextureSize));
     this.texWidth = W;
@@ -445,6 +487,7 @@ export class WebGLSplatRenderer {
   render(view, intr, viewport, camPos, framebuffer = null) {
     const gl = this.gl;
     if (this.contextLost || !this.mode || !this.tex.order || this.drawCount === 0) return;
+    this._syncGroups();
     gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
     gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
     gl.disable(gl.DEPTH_TEST);
@@ -470,6 +513,10 @@ export class WebGLSplatRenderer {
     gl.uniform1i(u.uShB, this.shB);
     gl.uniform1i(u.uShStride, this.shStride);
     gl.uniform1i(u.uMotion, this.mode === 'temporal' ? 1 : 0);
+    gl.uniform1i(u.uStaticRule, this.staticRule ? 1 : 0);
+    gl.uniform1f(u.uAlphaCut, this.alphaCut);
+    gl.uniform1i(u.uExt, this.hasExt ? 1 : 0);
+    gl.uniform1i(u.uGroupCount, this.groupTrack ? this.groupTrack.count : 0);
     gl.uniform1i(u.uTexWidth, this.texWidth);
     const bind = (unit, target, tex, loc) => {
       gl.activeTexture(gl.TEXTURE0 + unit);
@@ -482,6 +529,8 @@ export class WebGLSplatRenderer {
     bind(3, gl.TEXTURE_2D, this.tex.t3, u.uT3);
     bind(4, gl.TEXTURE_2D_ARRAY, this.tex.tc, u.uTC);
     bind(5, gl.TEXTURE_2D, this.tex.order, u.uOrder);
+    bind(6, gl.TEXTURE_2D, this.tex.t4 || this.dummy, u.uT4);
+    bind(7, gl.TEXTURE_2D, this.tex.groups || this.dummy, u.uGroups);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.drawCount);
     gl.bindVertexArray(null);
   }

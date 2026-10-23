@@ -42,6 +42,34 @@
       "group": "home",
       "limits": null,
       "cam": null
+    },
+    {
+      "id": "ruan-4",
+      "name": "Ruan 4",
+      "file": "ruan_4.sog4d",
+      "format": "sog4d",
+      "sizeMB": 13.2,
+      "count": 626062,
+      "duration": 4,
+      "tags": [
+        "SuperSplat 4D (.sog4d)",
+        "626,062 4D Gaussians",
+        "4 s clip"
+      ],
+      "credit": null,
+      "group": "home",
+      "limits": null,
+      "cam": {
+        "yaw": 0.7,
+        "pitch": -0.15,
+        "roll": 0,
+        "dolly": 5.0,
+        "pan": [
+          0,
+          0,
+          0
+        ]
+      }
     }
   ]
 }

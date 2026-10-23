@@ -28,7 +28,7 @@ export const TEMPLATE = `
       <h2>4D Viewer</h2>
       <p>Drop a splat file anywhere, or</p>
       <p><button type="button" class="primary" data-el="pick">${ICON.upload} Upload scene</button></p>
-      <p class="formats"><code>.nx4d</code> <code>.nxs4</code> <code>.ply</code> <code>.spz</code> <code>.sog</code> <code>.glb</code> <code>.splat</code> <code>.ksplat</code> <code>.usdz</code></p>
+      <p class="formats"><code>.nx4d</code> <code>.nxs4</code> <code>.ply</code> <code>.sog4d</code> <code>.spz</code> <code>.sog</code> <code>.glb</code> <code>.splat</code> <code>.ksplat</code> <code>.usdz</code></p>
     </div>
     <div data-el="drop-loading" class="loading-box" aria-live="polite">
       <div class="tg4d-spinner" aria-hidden="true"></div>
@@ -40,7 +40,7 @@ export const TEMPLATE = `
   </div>
 </div>
 <div class="tg4d-dropzone hidden" data-el="dropzone" aria-hidden="true"><span>Drop to open</span></div>
-<input data-el="file" type="file" accept=".nx4d,.nxs4,.ply,.spz,.sog,.gltf,.glb,.splat,.ksplat,.usdz,.usda" hidden />
+<input data-el="file" type="file" accept=".nx4d,.nxs4,.ply,.sog4d,.spz,.sog,.gltf,.glb,.splat,.ksplat,.usdz,.usda" hidden />
 
 <div class="tg4d-hud hidden" data-el="hud" role="group" aria-label="Playback">
   <button type="button" class="round" data-el="play" title="Play / pause (space)" aria-label="Pause" aria-pressed="true">⏸</button>

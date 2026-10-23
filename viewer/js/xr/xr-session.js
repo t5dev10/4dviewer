@@ -8,6 +8,7 @@
 
 import { multiplyRowMajor, transposeToColumnMajor } from '../core/camera.js';
 import { IDENTITY_XF, applyXf, modelMatrix } from '../core/transform.js';
+import { sortInitMessage, sortPoses, sortWindow } from '../render/sort-protocol.js';
 
 const FLIP_YZ = Float32Array.from([1, 0, 0, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1]);
 
@@ -161,15 +162,12 @@ export class XRPlayer {
     const w = temporal
       ? new Worker(new URL('../render/sort-worker-temporal.js', import.meta.url), { type: 'module' })
       : new Worker(new URL('../render/sort-worker-static.js', import.meta.url), { type: 'module' });
-    if (temporal) {
-      const geo = scene.geo.slice();
-      w.postMessage({ geo, count: scene.count, duration: scene.duration }, [geo.buffer]);
-    } else {
-      const positions = scene.positions.slice();
-      w.postMessage({ positions, count: scene.count }, [positions.buffer]);
-    }
+    const { msg, transfer } = sortInitMessage(scene);
+    w.postMessage(msg, transfer);
     w.onmessage = (e) => {
       this.sortInFlight = false;
+      const rtt = (performance.now() - this.sortSentAt) / 1000;
+      this.sortRtt = this.sortRtt ? 0.8 * this.sortRtt + 0.2 * rtt : rtt;
       this.renderer.updateOrder(e.data.indices);
     };
     this.sortWorker = w;
@@ -258,7 +256,11 @@ export class XRPlayer {
     });
     if (views[0] && !this.sortInFlight && this.sortWorker) {
       this.sortInFlight = true;
-      this.sortWorker.postMessage({ view: Array.from(views[0].m), t: this.renderer.time, gen: 0 });
+      this.sortSentAt = performance.now();
+      const t = this.renderer.time;
+      this.sortWorker.postMessage({
+        view: Array.from(views[0].m), t, gen: 0, window: sortWindow(this.sortRtt), poses: sortPoses(scene, t),
+      });
     }
     for (const { v, m } of views) {
       const vp = layer.getViewport(v);

@@ -27,6 +27,8 @@ Everything else is in the **≡ menu**:
   first, full-detail chunks arrive by time and view, optional audio slaved to the scene clock). Each splat moves
   along its velocity, fades through a temporal Gaussian gate and is coloured by spherical harmonics × a Fourier
   series in time, all evaluated in the shader at one clock value.
+- **SuperSplat 4D `.sog4d`** — single and multi-splat archives (static SOG folders + a dynamic set): linear motion
+  and the temporal RBF gate on SuperSplat's absolute clock (`start` … `start + duration`), with its alpha cut-off.
 - **Static** — reference 3DGS `.ply` (SH ≤ 3) and PlayCanvas compressed `.ply`, Niantic `.spz` v1–v4, PlayCanvas
   `.sog` v1/v2, glTF/GLB `KHR_gaussian_splatting`, `.splat`, `.ksplat`, ASCII OpenUSD `.usda` / `.usdz`.
   View-dependent colour is rendered for every format that carries it.

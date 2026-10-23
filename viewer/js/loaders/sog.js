@@ -43,7 +43,7 @@ function readbackExact(bitmap) {
   }
 }
 
-async function decodeWebp(bytes) {
+export async function decodeWebp(bytes) {
   const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/webp' }),
     { premultiplyAlpha: 'none', colorSpaceConversion: 'none' });
   const { width, height } = bitmap;
@@ -109,6 +109,16 @@ export async function loadSog(buffer, sourceUrl) {
     throw new Error(`sog: meta.json is not valid JSON (${err.message})`);
   }
   if (!meta || typeof meta !== 'object') throw new Error('sog: meta.json must be a JSON object');
+  if ((meta.type === 'sog4d' || meta.type === 'sog4d_multi') && bytes[0] === 0x50) {
+    const { loadSog4d } = await import('./sog4d.js');
+    return loadSog4d(buffer);
+  }
+  return decodeSogMeta(meta, fetchFile);
+}
+
+// A parsed meta.json plus a way to read the files it names (also used for
+// the static folders of a multi-splat .sog4d).
+export function decodeSogMeta(meta, fetchFile) {
   if (meta.version === 2) return decodeV2(meta, fetchFile);
   if (meta.version === undefined && Array.isArray(meta.means?.shape)) return decodeV1(meta, fetchFile);
   throw new Error(`sog: unsupported meta.json version ${meta.version} (this reader handles 1 and 2)`);

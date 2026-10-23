@@ -69,7 +69,7 @@ export function isStaticSplat(tau, duration) {
 
 export function sceneTransferables(scene) {
   const list = [];
-  for (const key of ['positions', 'scales', 'rotations', 'opacities', 'colorsDC', 'shRest', 'geo', 'sht']) {
+  for (const key of ['positions', 'scales', 'rotations', 'opacities', 'colorsDC', 'shRest', 'geo', 'sht', 'ext']) {
     const a = scene[key];
     if (a && a.buffer && !list.includes(a.buffer)) list.push(a.buffer);
   }

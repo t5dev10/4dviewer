@@ -1,6 +1,7 @@
 // GLSL for the WebGL2 path. One program draws both static and 4D scenes: a
 // static scene is the 4D model with no motion texture, gate ≡ 1 and one
-// Fourier order.
+// Fourier order. 4D scenes may add per-splat time windows and rigid group
+// poses (uT4 / uGroups).
 
 export const MAX_FOURIER = 16;
 
@@ -26,11 +27,17 @@ uniform int uShF;            // Fourier orders in use
 uniform int uShB;            // SH bands per order in use, (l+1)^2
 uniform int uShStride;       // layers per order in the colour texture
 uniform bool uMotion;
+uniform bool uStaticRule;    // nx4d: splats living longer than 0.6 T never fade
+uniform float uAlphaCut;     // source-specific visibility floor (>= 0.0016)
+uniform bool uExt;
+uniform int uGroupCount;
 uniform int uTexWidth;
 uniform sampler2D uT0;       // mu.xyz, mu_t
 uniform sampler2D uT1;       // v.xyz, tau
 uniform sampler2D uT2;       // Sxx Sxy Sxz Syy
 uniform sampler2D uT3;       // Syz Szz opacity flags
+uniform sampler2D uT4;       // window lo, window hi, group, -
+uniform sampler2D uGroups;   // row g: (0) quaternion xyzw, (1) translation
 uniform sampler2DArray uTC;  // layer n*uShStride + b: SH coefficient rgb
 uniform usampler2D uOrder;
 
@@ -54,12 +61,26 @@ void cull() {
   vLocal = vec2(0.0);
 }
 
+mat3 quatMat(vec4 q) {
+  float x = q.x, y = q.y, z = q.z, w = q.w;
+  return mat3(1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z), 2.0 * (x * z - w * y),
+              2.0 * (x * y - w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x),
+              2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y));
+}
+
 void main() {
   int slot = gl_InstanceID;
   int idx = int(texelFetch(uOrder, ivec2(slot % uTexWidth, slot / uTexWidth), 0).r);
   ivec2 tc = ivec2(idx % uTexWidth, idx / uTexWidth);
   vec4 a0 = texelFetch(uT0, tc, 0);
   vec4 a3 = texelFetch(uT3, tc, 0);
+
+  int group = -1;
+  if (uExt) {
+    vec4 a4 = texelFetch(uT4, tc, 0);
+    if (uT < a4.x || uT >= a4.y) { cull(); return; }
+    group = int(floor(a4.z + 0.5));
+  }
 
   float dt = 0.0;
   float gate = 1.0;
@@ -69,15 +90,21 @@ void main() {
     vec4 a1 = texelFetch(uT1, tc, 0);
     dt = uT - a0.w;
     // Static rule (sqrt(Σtt) > 0.6 T with Σtt = 1/(2τ)): gate ≡ 1, orders n ≥ 1 skipped.
-    isStatic = a1.w > 0.0 && sqrt(0.5 / a1.w) > 0.6 * uDuration;
+    isStatic = uStaticRule && a1.w > 0.0 && sqrt(0.5 / a1.w) > 0.6 * uDuration;
     gate = isStatic ? 1.0 : exp(-dt * dt * a1.w);
     p += a1.xyz * dt;
+  }
+  bool grouped = group >= 0 && group < uGroupCount;
+  mat3 G = mat3(1.0);
+  if (grouped) {
+    G = quatMat(texelFetch(uGroups, ivec2(0, group), 0));
+    p = G * p + texelFetch(uGroups, ivec2(1, group), 0).xyz;
   }
   float reveal = revealFactor(p);
   float alpha = a3.z * gate * reveal;
   // Fade through the visibility cut instead of popping as a gate crosses it.
   alpha *= smoothstep(0.0020, 0.0060, alpha);
-  if (alpha < 0.0016) { cull(); return; }
+  if (alpha < uAlphaCut) { cull(); return; }
 
   vec4 v = uView * vec4(p, 1.0);
   if (v.z < 0.05) { cull(); return; }
@@ -86,6 +113,7 @@ void main() {
   mat3 S = mat3(a2.x, a2.y, a2.z,
                 a2.y, a2.w, a3.x,
                 a2.z, a3.x, a3.y);
+  if (grouped) S = G * S * transpose(G);
   mat3 W = mat3(uView);
   mat3 VS = W * S * transpose(W);
 
@@ -117,8 +145,10 @@ void main() {
   gl_Position = vec4(px.x / uViewport.x * 2.0 - 1.0, 1.0 - px.y / uViewport.y * 2.0, 0.0, 1.0);
   vLocal = corner * 3.0;
 
-  // 4D spherindrical harmonics: c(d, t) = Σ_n Σ_b cos(2π n dt / T) Y_b(d) c_nb.
+  // 4D spherindrical harmonics: c(d, t) = Σ_n Σ_b cos(2π n dt / T) Y_b(d) c_nb,
+  // with d in the splat's own (rest) frame.
   vec3 d = normalize(p - uCamPos);
+  if (grouped) d = transpose(G) * d;
   float Y[16];
   Y[0] = SH_C0;
   if (uShB > 1) {
