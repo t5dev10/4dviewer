@@ -1,17 +1,24 @@
-// The viewer application: one call mounts a complete player into an element.
+// The viewer application: one call mounts a complete full-screen player.
 //
-//   const handle = mountViewer(el, { scene: 'bloom', onEvent(type, data) {} });
-//   const handle = mountViewer(el, { fromUrl: true }); // standalone page: read ?scene=…
+//   const handle = mountViewer(el, { fromUrl: true, route: true }); // site page: /<scene>?t=…&cam=…
+//   const handle = mountViewer(el, { scene: 'lumen', onEvent(type, data) {} });
 
 import { TEMPLATE, injectStyles } from './template.js';
+import { createMenu } from './menu.js';
+import { replaceAddress, resolveSceneName, sceneFromPath, sceneHref } from './router.js';
+import { repoFor } from './publish.js';
 import { detectCapabilities, preferredColorSpace, preferredPowerMode } from '../core/capabilities.js';
 import { detectFormatFromName, formatLabel, parseUrlConfig } from '../core/formats.js';
 import {
-  FOV_Y, clampOrbit, defaultOrbit, focalPx, orbitFromView, orbitView, projectPoint,
+  clampOrbit, defaultOrbit, focalPx, multiplyRowMajor, orbitFromView, orbitView, projectPoint,
 } from '../core/camera.js';
+import {
+  IDENTITY_XF, applyXf, applyXfDirection, cloneXf, decodeXf, encodeXf, isIdentityXf, modelMatrix,
+  transformStaticScene, unapplyXf, xfFromManifest, xfToManifest,
+} from '../core/transform.js';
 import { applyRendererPolicy, createQuality, QUALITY_TIERS, updateQuality } from '../core/quality.js';
 import { dataBudget, dataTier, readEnvSignals, readTierEnvironment, resolveTier } from '../core/device-tier.js';
-import { buildShareUrl, parseDeepLink } from '../core/deeplink.js';
+import { encodeCam, parseDeepLink } from '../core/deeplink.js';
 import { subscribeFrames } from '../core/frame-driver.js';
 import { runWorkerJob } from '../core/workers.js';
 import { validateFile } from '../core/validate.js';
@@ -20,6 +27,8 @@ import { sliceAt } from '../export/slice.js';
 import { sceneToGLB, sceneToPLY } from '../export/writers.js';
 
 const ASSETS = new URL('../../assets/', import.meta.url);
+const MANIFEST_URL = new URL('scenes.json', ASSETS);
+const DEFAULT_FOV = 60;
 const GROW_MS = 1600;
 const INERTIA_TAU = 300;
 const STOP_SPEED = 4e-5;
@@ -29,6 +38,7 @@ const ROLL_GAIN = 0.25;
 const SAMPLE_WINDOW = 60;
 const MIN_SAMPLE_SPAN = 12;
 const DOUBLE_TAP_MS = 320;
+const IDLE_MS = 3000;
 
 class Gone extends Error {
   constructor() {
@@ -37,6 +47,7 @@ class Gone extends Error {
   }
 }
 const quiet = (err) => err instanceof Gone || err?.name === 'InstanceGone' || err?.name === 'AbortError';
+const toRad = (d) => (d * Math.PI) / 180;
 
 function decodeInWorker(buffer, format, sourceUrl, up) {
   return runWorkerJob('scene-decode',
@@ -47,6 +58,7 @@ function decodeInWorker(buffer, format, sourceUrl, up) {
 export function mountViewer(root, options = {}) {
   const reducedMotion = typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
   const fromUrl = !!options.fromUrl;
+  const query = typeof location !== 'undefined' ? new URLSearchParams(location.search) : new URLSearchParams();
   const cfg = fromUrl ? parseUrlConfig() : {
     scene: options.scene ?? null, format: options.format ?? null, up: options.up ?? null, gpu: options.gpu ?? null,
     perf: options.perf ?? null, uiMin: !!options.minimalUi, usdz: options.usdz ?? null, xrDisabled: !!options.xrDisabled,
@@ -54,7 +66,9 @@ export function mountViewer(root, options = {}) {
     dolly: options.dolly ?? null, yaw: options.yaw ?? null, pitch: options.pitch ?? null, roll: options.roll ?? null,
   };
   cfg.manifest = options.manifest || null;
-  cfg.hideChips = !!options.hideSceneChips;
+  cfg.route = !!options.route;
+  cfg.xf = fromUrl ? decodeXf(query.get('xf')) : (options.transform ?? null);
+  cfg.fov = fromUrl ? Number(query.get('fov')) || null : (options.fov ?? null);
   const emit = typeof options.onEvent === 'function' ? options.onEvent : () => {};
   const env = readEnvSignals();
   const budget = dataBudget(dataTier(env));
@@ -65,18 +79,21 @@ export function mountViewer(root, options = {}) {
   let unsubscribe = null;
   let resizeObs = null;
   let mutedOverride = null;
+  let menu = null;
+  let lastActivity = performance.now();
   let device = { tier: 'desktop', policy: {}, reasons: ['capabilities not probed yet'], webview: { isWebview: false } };
 
   const state = {
     kind: null, temporalScene: null, staticScene: null, format: null, sourceUrl: null,
     playing: !reducedMotion && budget.autoplay !== false,
     t: 0, lastWall: 0, grow: 1, growStart: 0,
-    cam: defaultOrbit(), camOverride: null, camLimits: null,
+    cam: defaultOrbit(), camOverride: null, camLimits: null, fov: cfg.fov || DEFAULT_FOV,
+    xf: cloneXf(cfg.xf || IDENTITY_XF), xfFromUrl: !!cfg.xf,
     glRenderer: null, gpuRenderer: null, usingGpu: false, webgpuDead: false,
     sortWorker: null, sortGen: 0, sortInFlight: false, sortEpoch: 0, sortSentAt: 0, sortRtt: 0,
-    lastFrameKey: '', lastSortKey: '', lastStatsAt: 0,
-    caps: null, manifest: null, activeSceneId: null,
-    stream: null, streamController: null, audio: null, xr: null,
+    lastFrameKey: '', lastSortKey: '', lastStatsAt: 0, showStats: query.get('stats') === '1',
+    caps: null, manifest: null, activeSceneId: null, sceneName: '', credit: '', localFile: null,
+    stream: null, streamController: null, audio: null, xr: null, qualityTier: 'auto',
     quality, budget, env, hotspots: new Map(), chapters: [], playlist: { items: [], index: -1 },
     draws: 0, lastVerdict: null,
   };
@@ -88,11 +105,20 @@ export function mountViewer(root, options = {}) {
   const els = {};
   const width = () => root.clientWidth || 1;
   const height = () => root.clientHeight || 1;
+  const fovRad = () => toRad(state.fov);
 
   // --- small UI helpers -------------------------------------------------------
 
   function announce(text) {
     if (els.sr) els.sr.textContent = text;
+  }
+
+  let toastTimer = 0;
+  function toast(text) {
+    els.toast.textContent = text;
+    els.toast.classList.add('shown');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => els.toast.classList.remove('shown'), 2200);
   }
 
   function showError(message) {
@@ -105,24 +131,12 @@ export function mountViewer(root, options = {}) {
     }
   }
 
-  function syncPlayButton() {
+  function syncHud() {
     const temporal = state.kind === 'temporal';
-    els.play.disabled = !temporal;
-    els.scrub.disabled = !temporal;
-    els.hud.classList.toggle('static', state.kind === 'static');
+    els.hud.classList.toggle('hidden', !temporal);
     els.play.textContent = state.playing ? '⏸' : '▶';
     els.play.setAttribute('aria-label', state.playing ? 'Pause' : 'Play');
     els.play.setAttribute('aria-pressed', String(state.playing));
-  }
-
-  function setCredit(entry, fromFile = false) {
-    const el = $('credit');
-    if (!el) return;
-    // A host page that draws its own chips also shows the manifest credit itself;
-    // credits carried by the file always stay visible.
-    if (cfg.hideChips && !fromFile) return;
-    el.textContent = entry?.credit || '';
-    el.classList.toggle('format-credit', fromFile && !!entry?.credit);
   }
 
   function progress(loaded, total) {
@@ -143,7 +157,7 @@ export function mountViewer(root, options = {}) {
   }
 
   // Scene audio starts muted (a browser would otherwise start it on the first
-  // drag); ?muted=0 or setMuted(false) turns it on.
+  // drag); ?muted=0 or the menu turns it on.
   function isMuted() {
     if (mutedOverride !== null) return mutedOverride;
     if (device.policy.allowAudio === false) return true;
@@ -151,11 +165,22 @@ export function mountViewer(root, options = {}) {
     return true;
   }
 
+  function markActive() {
+    lastActivity = performance.now();
+    if (root.classList.contains('idle')) root.classList.remove('idle');
+  }
+
   // --- scene geometry -----------------------------------------------------------
 
-  function sceneBounds() {
+  function localBounds() {
     const s = state.kind === 'temporal' ? state.temporalScene : state.staticScene;
     return s ? { center: s.center, radius: s.radius } : { center: [0, 0, 0], radius: 1 };
+  }
+
+  // Bounds after the scene placement: the orbit turns around these.
+  function sceneBounds() {
+    const { center, radius } = localBounds();
+    return { center: applyXf(state.xf, center), radius: radius * state.xf.s };
   }
 
   function sceneCount() {
@@ -165,30 +190,50 @@ export function mountViewer(root, options = {}) {
   function initialCamera() {
     const o = state.camOverride || {};
     const { center, radius } = sceneBounds();
-    const fromView = state.kind === 'temporal' && state.temporalScene?.view
-      ? orbitFromView(state.temporalScene.view, center, radius) : null;
-    const pick = (...v) => v.find((x) => Number.isFinite(x));
+    const v = state.kind === 'temporal' ? state.temporalScene?.view : null;
+    const fromView = v ? orbitFromView({
+      eye: applyXf(state.xf, v.eye), target: applyXf(state.xf, v.target), up: applyXfDirection(state.xf, v.up),
+    }, center, radius) : null;
+    const pick = (...vals) => vals.find((x) => Number.isFinite(x));
     // The field of view is fixed vertically, so a portrait screen sees less
     // width; back the opening camera off to keep wide scenes in frame.
     const aspect = width() / height();
     const portrait = aspect < 1 ? Math.min(1.9, 1 / Math.max(aspect, 0.5)) : 1;
+    let pan = [0, 0, 0];
+    if (Array.isArray(o.pan) && o.pan.length === 3) pan = o.pan.slice();
+    else if (fromView && !Number.isFinite(o.yaw) && !Number.isFinite(cfg.yaw)) pan = fromView.pan.slice();
     return {
       yaw: pick(o.yaw, cfg.yaw, fromView?.yaw, 0),
       pitch: pick(o.pitch, cfg.pitch, fromView?.pitch, -0.15),
       roll: pick(o.roll, cfg.roll, fromView?.roll, 0),
       dolly: pick(o.dolly, cfg.dolly, fromView?.dolly, 2.2) * portrait,
-      pan: fromView && !Number.isFinite(o.yaw) && !Number.isFinite(cfg.yaw) ? fromView.pan.slice() : [0, 0, 0],
+      pan,
     };
   }
 
-  function currentView() {
+  function resetView() {
+    state.cam = initialCamera();
+    if (Number.isFinite(state.camOverride?.fov)) state.fov = state.camOverride.fov;
+    else if (!cfg.fov) state.fov = DEFAULT_FOV;
+  }
+
+  // World view (orbit camera) and the matrices the renderer and sorter use:
+  // `m` maps the scene's own coordinates straight to the camera.
+  function frameView() {
     const { center, radius } = sceneBounds();
-    return orbitView(state.cam, center, radius);
+    const world = orbitView(state.cam, center, radius);
+    const model = modelMatrix(state.xf);
+    return {
+      m: multiplyRowMajor(world.m, model),
+      viewWorld: world.m,
+      eyeWorld: world.eye,
+      eyeLocal: unapplyXf(state.xf, world.eye),
+    };
   }
 
   function setReveal() {
     if (!state.kind) return;
-    const { center, radius } = sceneBounds();
+    const { center, radius } = localBounds();
     const inv = radius > 1e-6 ? 1 / radius : 0;
     for (const r of [state.glRenderer, state.gpuRenderer]) {
       if (!r) continue;
@@ -208,6 +253,14 @@ export function mountViewer(root, options = {}) {
   function warmUpQuality() {
     quality.emaGap = 16;
     quality.lastAdjustAt = performance.now() + 1000;
+  }
+
+  // The orbit is relative to the placed scene's centre, so the camera keeps
+  // framing the scene while it is rotated, moved or scaled.
+  function setXf(xf) {
+    state.xf = cloneXf(xf);
+    state.lastFrameKey = '';
+    state.lastSortKey = '';
   }
 
   // --- sorting --------------------------------------------------------------------
@@ -313,7 +366,6 @@ export function mountViewer(root, options = {}) {
     }
     els.gl?.classList.toggle('hidden', state.usingGpu);
     applyRendererPolicy(quality, cfg, state);
-    updateXRButtons();
   }
 
   function teardownScene() {
@@ -342,8 +394,16 @@ export function mountViewer(root, options = {}) {
     inertia.samples.length = 0;
   }
 
+  function updateIdle(now) {
+    const canHide = state.kind && !menu?.isOpen() && pointers.size === 0 &&
+      (state.kind === 'static' || state.playing) && els.drop.classList.contains('hidden');
+    if (canHide && now - lastActivity > IDLE_MS) root.classList.add('idle');
+    else if (!canHide) root.classList.remove('idle');
+  }
+
   function frame(now) {
     if (destroyed || !state.kind || state.xr) return;
+    updateIdle(now);
     if (inertia.active && pointers.size === 0) {
       const dt = state.lastWall ? Math.min(64, now - state.lastWall) : 16.67;
       state.cam.yaw += inertia.vYaw * dt;
@@ -372,6 +432,7 @@ export function mountViewer(root, options = {}) {
     if (duration && document.activeElement !== els.scrub) els.scrub.value = String(state.t / duration);
     state.lastWall = now;
     state.audio?.tick();
+    menu?.syncCamera();
 
     const dpr = Math.min(devicePixelRatio || 1, 2) * quality.scale;
     const canvas = state.usingGpu ? els.gpu : els.gl;
@@ -380,7 +441,7 @@ export function mountViewer(root, options = {}) {
     const H = Math.max(2, Math.floor(height() * dpr));
     const c = state.cam;
     const camKey = `${c.yaw.toFixed(4)},${c.pitch.toFixed(4)},${c.roll.toFixed(4)},${c.dolly.toFixed(4)},` +
-      `${c.pan[0].toFixed(3)},${c.pan[1].toFixed(3)},${c.pan[2].toFixed(3)}`;
+      `${c.pan[0].toFixed(3)},${c.pan[1].toFixed(3)},${c.pan[2].toFixed(3)}|${state.fov}|${encodeXf(state.xf)}`;
     const frameKey = `${camKey}|${state.t.toFixed(4)}|${state.grow.toFixed(3)}|${W}x${H}|${state.sortEpoch}|${state.usingGpu}`;
     if (frameKey === state.lastFrameKey) return;
     state.lastFrameKey = frameKey;
@@ -390,8 +451,8 @@ export function mountViewer(root, options = {}) {
       canvas.height = H;
     }
     els.time.textContent = duration ? `${state.t.toFixed(2)} / ${duration.toFixed(2)} s` : '';
-    const { m, eye } = currentView();
-    const f = focalPx(FOV_Y, H);
+    const view = frameView();
+    const f = focalPx(fovRad(), H);
     const t0 = performance.now();
     const sortKey = `${camKey}|${(Math.round(state.t * 30) / 30).toFixed(3)}`;
     const needSort = sortKey !== state.lastSortKey;
@@ -400,9 +461,9 @@ export function mountViewer(root, options = {}) {
       state.gpuRenderer.grow = state.grow;
       if (needSort) {
         state.lastSortKey = sortKey;
-        state.gpuRenderer.requestSort(m, state.t);
+        state.gpuRenderer.requestSort(view.m, state.t);
       }
-      state.gpuRenderer.render(m, { fx: f, fy: f, cx: W / 2, cy: H / 2 }, eye, state.t);
+      state.gpuRenderer.render(view.m, { fx: f, fy: f, cx: W / 2, cy: H / 2 }, view.eyeLocal, state.t);
       drawn = sceneCount();
     } else if (state.glRenderer) {
       const r = state.glRenderer;
@@ -411,17 +472,17 @@ export function mountViewer(root, options = {}) {
         state.sortInFlight = true;
         state.sortSentAt = performance.now();
         state.sortWorker.postMessage({
-          view: Array.from(m), t: state.t, gen: ++state.sortGen, cap: quality.splatCap || 0,
+          view: Array.from(view.m), t: state.t, gen: ++state.sortGen, cap: quality.splatCap || 0,
           window: (state.sortRtt || 0) + 1 / 30,
         });
       }
       r.grow = state.grow;
       r.time = state.t;
       r.clear();
-      r.render(m, { fx: f, fy: f, cx: W / 2, cy: H / 2 }, { x: 0, y: 0, width: W, height: H }, eye);
+      r.render(view.m, { fx: f, fy: f, cx: W / 2, cy: H / 2 }, { x: 0, y: 0, width: W, height: H }, view.eyeLocal);
       drawn = state.temporalScene?.streaming ? state.temporalScene.count : r.count;
     }
-    if (now - state.lastStatsAt > 500) {
+    if (state.showStats && now - state.lastStatsAt > 500) {
       state.lastStatsAt = now;
       const api = state.usingGpu ? 'WebGPU' : 'WebGL2';
       const nearest = !state.usingGpu && state.glRenderer && state.glRenderer.drawCount < drawn
@@ -456,8 +517,8 @@ export function mountViewer(root, options = {}) {
   function pan(dx, dy, gain) {
     const cam = state.cam;
     const { radius } = sceneBounds();
-    const k = (radius * cam.dolly) / height();
-    const { m } = currentView();
+    const k = ((radius * cam.dolly) / height()) * (Math.tan(fovRad() / 2) / Math.tan(toRad(DEFAULT_FOV) / 2));
+    const { viewWorld: m } = frameView();
     for (let a = 0; a < 3; ++a) cam.pan[a] -= (dx * gain * m[a] + dy * gain * m[4 + a]) * k;
   }
 
@@ -469,12 +530,11 @@ export function mountViewer(root, options = {}) {
       e.preventDefault();
       root.focus?.({ preventScroll: true });
       stopInertia();
-      els.hint.classList.remove('shown');
-      els.help.setAttribute('aria-expanded', 'false');
+      if (menu?.isOpen() && isNarrow()) menu.close();
       pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (e.pointerType === 'touch' && pointers.size === 1) {
         const now = performance.now();
-        if (now - lastTap < DOUBLE_TAP_MS) state.cam = initialCamera();
+        if (now - lastTap < DOUBLE_TAP_MS) resetView();
         lastTap = now;
       }
       try {
@@ -532,25 +592,31 @@ export function mountViewer(root, options = {}) {
       state.cam.dolly *= 1 + e.deltaY * 0.001;
       clampOrbit(state.cam, state.camLimits);
     }, { passive: false, ...opts });
-    canvas.addEventListener('dblclick', () => {
-      state.cam = initialCamera();
-    }, opts);
+    canvas.addEventListener('dblclick', () => resetView(), opts);
     canvas.addEventListener('contextmenu', (e) => e.preventDefault(), opts);
   }
 
+  const isNarrow = () => width() <= 640;
+
   function attachKeys() {
     root.addEventListener('keydown', (e) => {
-      if (e.target instanceof HTMLInputElement && e.target.type !== 'range') return;
+      markActive();
+      const t = e.target;
+      if ((t instanceof HTMLInputElement && t.type !== 'range' && t.type !== 'checkbox') || t instanceof HTMLSelectElement) return;
       if (e.key === ' ') {
         e.preventDefault();
-        if (!els.play.disabled) els.play.click();
+        if (state.kind === 'temporal') els.play.click();
       } else if (e.key === 'r' || e.key === 'R') {
-        state.cam = initialCamera();
-      } else if (e.key === '?') {
-        const shown = els.hint.classList.toggle('shown');
-        els.help.setAttribute('aria-expanded', String(shown));
+        resetView();
+      } else if (e.key === 'm' || e.key === 'M') {
+        menu.toggle();
+      } else if (e.key === 'Escape' && menu.isOpen()) {
+        menu.close();
       }
     }, { signal: aborter.signal });
+    for (const type of ['pointermove', 'pointerdown', 'wheel', 'touchstart']) {
+      root.addEventListener(type, markActive, { passive: true, signal: aborter.signal });
+    }
     const reset = () => {
       pointers.clear();
       pinchDist = 0;
@@ -563,6 +629,14 @@ export function mountViewer(root, options = {}) {
   }
 
   // --- loading ---------------------------------------------------------------------------
+
+  function sceneDisplayName(url) {
+    try {
+      return decodeURIComponent(new URL(url, location.href).pathname.split('/').pop()) || url;
+    } catch {
+      return url;
+    }
+  }
 
   async function loadBuffer(buffer, format, sourceUrl, opts = {}) {
     alive();
@@ -584,26 +658,34 @@ export function mountViewer(root, options = {}) {
       state.staticScene = scene;
       state.temporalScene = null;
     }
-    state.cam = initialCamera();
-    if (scene.credit) setCredit({ credit: scene.credit }, true);
-    els.badge.textContent = formatLabel(format);
+    if (scene.credit && !state.credit) state.credit = scene.credit;
+    resetView();
     els.drop.classList.add('hidden');
     els.drop.classList.remove('loading');
-    els.ply.disabled = false;
-    els.glb.disabled = false;
     els.scrub.value = '0';
-    syncPlayButton();
+    syncHud();
     await setupRenderer();
     state.grow = reducedMotion ? 1 : 0;
     state.growStart = 0;
     setReveal();
     warmUpQuality();
+    menu?.refresh();
     for (const w of scene.warnings || []) emit('warning', { message: w, format });
     emit('loaded', { format, kind: scene.kind, count: scene.count, duration: scene.kind === 'temporal' ? scene.duration : null });
     announce(`Scene loaded: ${scene.count.toLocaleString()} splats${scene.kind === 'temporal' ? `, ${scene.duration.toFixed(1)} seconds` : ''}`);
     if (scene.audio && scene.audioTracks?.length) {
       startAudio(scene, async (track) => track.bytes || null).catch((err) => quiet(err) || console.warn('[4dviewer] audio unavailable:', err));
     }
+  }
+
+  function listenerFrame() {
+    if (!state.kind) return null;
+    const { m, eyeLocal } = frameView();
+    const n = (a, b, c) => {
+      const l = Math.hypot(a, b, c) || 1;
+      return [a / l, b / l, c / l];
+    };
+    return { position: eyeLocal, forward: n(m[8], m[9], m[10]), up: n(-m[4], -m[5], -m[6]) };
   }
 
   async function startAudio(scene, fetchChunk) {
@@ -614,11 +696,7 @@ export function mountViewer(root, options = {}) {
       getTime: () => state.t,
       getDuration: () => (state.kind === 'temporal' && state.temporalScene?.duration) || 0,
       isPlaying: () => state.playing && state.grow >= 1,
-      getListener: () => {
-        if (!state.kind) return null;
-        const { m, eye } = currentView();
-        return { position: eye, forward: [m[8], m[9], m[10]], up: [-m[4], -m[5], -m[6]] };
-      },
+      getListener: listenerFrame,
       muted: isMuted(),
     });
     const tracks = [];
@@ -641,6 +719,7 @@ export function mountViewer(root, options = {}) {
     state.audio = sync;
     els.mute.classList.remove('hidden');
     syncMuteButton();
+    menu?.renderView();
     emit('audio', { tracks: result.tracks, failed: result.failed, muted: sync.isMuted() });
   }
 
@@ -651,9 +730,18 @@ export function mountViewer(root, options = {}) {
     els.mute.setAttribute('aria-pressed', String(!muted));
   }
 
+  function setMuted(m) {
+    mutedOverride = !!m;
+    state.audio?.setMuted(mutedOverride);
+    syncMuteButton();
+    menu?.renderView();
+    emit('audio', { muted: mutedOverride });
+    return mutedOverride;
+  }
+
   async function fetchWithProgress(url) {
     const res = await fetch(url, { signal: aborter.signal });
-    if (!res.ok) throw new Error(`fetch ${url}: ${res.status}`);
+    if (!res.ok) throw new Error(res.status === 404 ? `The scene file was not found (${sceneDisplayName(url)})` : `fetch ${url}: ${res.status}`);
     const total = Number(res.headers.get('Content-Length')) || 0;
     if (!res.body) return res.arrayBuffer();
     const reader = res.body.getReader();
@@ -683,7 +771,7 @@ export function mountViewer(root, options = {}) {
       return false;
     }
     try {
-      showLoading(fmt === 'nx4d' || fmt === 'nxs4' ? 'Streaming 4D scene' : 'Loading scene');
+      showLoading(fmt === 'nx4d' || fmt === 'nxs4' ? 'Loading 4D scene' : 'Loading scene');
       progress(0, 0);
       if (fmt === 'nxs4') {
         try {
@@ -725,10 +813,11 @@ export function mountViewer(root, options = {}) {
       fetchDecorator: options.fetchDecorator,
       onAuthFailure: options.onAuthFailure,
       dataBudget: budget,
+      // Chunk bounds are in the scene's own coordinates, so the camera is too.
       getCamera: () => {
         if (!state.kind) return null;
-        const { m, eye } = currentView();
-        return { m, eye, fovY: FOV_Y, aspect: width() / Math.max(height(), 1) };
+        const { m, eyeLocal } = frameView();
+        return { m, eye: eyeLocal, fovY: fovRad(), aspect: width() / Math.max(height(), 1) };
       },
       getT: () => state.t,
       onFirstScene: (scene) => {
@@ -739,21 +828,18 @@ export function mountViewer(root, options = {}) {
         state.t = 0;
         state.lastWall = 0;
         state.lastFrameKey = '';
-        state.cam = initialCamera();
-        els.badge.textContent = formatLabel('nxs4');
+        if (scene.credit && !state.credit) state.credit = scene.credit;
+        resetView();
         els.drop.classList.add('hidden');
         els.drop.classList.remove('loading');
-        els.ply.disabled = true;
-        els.glb.disabled = true;
         els.scrub.value = '0';
-        setCredit(scene.credit ? { credit: scene.credit } : null, true);
-        syncPlayButton();
+        syncHud();
         applyRendererPolicy(quality, cfg, state);
-        updateXRButtons();
         state.grow = reducedMotion ? 1 : 0;
         state.growStart = 0;
         setReveal();
         warmUpQuality();
+        menu?.refresh();
         emit('loaded', { format: 'nxs4', kind: 'temporal', count: scene.count, duration: scene.duration, streaming: true });
         announce(`Streaming scene: ${scene.count.toLocaleString()} splats, ${scene.duration.toFixed(1)} seconds`);
         startStreamAudio();
@@ -797,130 +883,152 @@ export function mountViewer(root, options = {}) {
       verdict = await validateFile(file);
     } catch (err) {
       showError(`Could not read "${file.name}": ${err.message || err}`);
-      return;
+      return false;
     }
     if (!verdict.ok) {
       showError(verdict.reason);
       emit('error', { message: verdict.reason, format: verdict.format });
-      return;
+      return false;
     }
     for (const w of verdict.warnings) emit('warning', { message: w, format: verdict.format });
     state.lastVerdict = verdict;
     state.activeSceneId = null;
     state.camOverride = null;
     state.camLimits = null;
-    setCredit(null);
-    renderChips();
+    state.credit = '';
+    state.sceneName = file.name;
+    state.localFile = file;
+    if (!state.xfFromUrl) state.xf = cloneXf(IDENTITY_XF);
+    if (cfg.route) replaceAddress(null);
     try {
       showLoading('Reading local file');
       progress(0, file.size);
       const buffer = await file.arrayBuffer();
       progress(file.size, file.size);
       await loadBuffer(buffer, verdict.format, null, { up: cfg.up });
+      return true;
     } catch (err) {
-      if (quiet(err)) return;
+      if (quiet(err)) return false;
       showError(String(err.message || err));
       emit('error', { message: String(err.message || err) });
+      return false;
     }
   }
 
   // --- scenes manifest -----------------------------------------------------------------------
 
-  const sceneUrl = (manifest, entry) => new URL((manifest.base || '') + entry.file, new URL('scenes.json', ASSETS)).href;
+  const sceneUrl = (manifest, entry) => new URL((manifest.base || '') + entry.file, MANIFEST_URL).href;
 
   async function fetchManifest() {
     try {
-      const res = await fetch(new URL('scenes.json', ASSETS), { cache: 'no-cache' });
+      const res = await fetch(MANIFEST_URL, { cache: 'no-cache' });
       return res.ok ? await res.json() : null;
     } catch {
       return null;
     }
   }
 
-  function groupScenes() {
-    const all = state.manifest?.scenes || [];
-    const group = all.find((s) => s.id === state.activeSceneId)?.group || 'home';
-    return all.filter((s) => (s.group || 'home') === group);
+  function defaultSceneId() {
+    const m = state.manifest;
+    return m?.default || m?.site?.default || m?.scenes?.[0]?.id || null;
   }
 
-  function renderChips() {
-    if (!state.manifest || cfg.uiMin || cfg.hideChips) return;
-    const list = groupScenes();
-    if (!list.length) return;
-    els.scenes.innerHTML = '';
-    for (const s of list) {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = `chip${s.id === state.activeSceneId ? ' active' : ''}`;
-      b.setAttribute('role', 'tab');
-      b.setAttribute('aria-selected', String(s.id === state.activeSceneId));
-      b.textContent = s.name;
-      b.title = `${s.sizeMB} MB${s.tags?.length ? ` · ${s.tags.join(' · ')}` : ''}`;
-      b.onclick = () => selectScene(s.id);
-      els.scenes.appendChild(b);
-    }
-    els.scenes.classList.remove('hidden');
-  }
-
-  async function selectScene(id) {
+  async function selectScene(id, { keepView = false } = {}) {
     const entry = state.manifest?.scenes?.find((s) => s.id === id);
-    if (!entry || state.activeSceneId === id) return;
+    if (!entry) return false;
+    if (state.activeSceneId === id && state.kind) return true;
     state.activeSceneId = id;
-    state.camOverride = entry.cam || null;
+    state.camOverride = keepView ? state.camOverride : (entry.cam || null);
     state.camLimits = entry.limits || null;
-    setCredit(entry);
-    renderChips();
-    await loadUrl(sceneUrl(state.manifest, entry), entry.format, { up: entry.up });
+    state.credit = entry.credit || '';
+    state.sceneName = entry.name || entry.id;
+    state.localFile = null;
+    if (!state.xfFromUrl) state.xf = cloneXf(xfFromManifest(entry.transform) || IDENTITY_XF);
+    state.xfFromUrl = false;
+    if (Number.isFinite(entry.cam?.fov) && !cfg.fov) state.fov = entry.cam.fov;
+    if (cfg.route) replaceAddress(id);
+    menu?.refresh();
+    return loadUrl(sceneUrl(state.manifest, entry), entry.format, { up: entry.up });
   }
 
-  // --- export & XR ---------------------------------------------------------------------------
+  // --- export, share, fullscreen, XR --------------------------------------------------------
 
   function exportScene(kind) {
     if (state.temporalScene?.streaming) return null;
-    const scene = state.kind === 'temporal' ? sliceAt(state.temporalScene, state.t) : state.staticScene;
+    let scene = state.kind === 'temporal' ? sliceAt(state.temporalScene, state.t) : state.staticScene;
     if (!scene) return null;
+    scene = transformStaticScene(scene, state.xf);
     return kind === 'glb' ? sceneToGLB(scene) : sceneToPLY(scene);
   }
 
   function download(kind) {
-    const btn = kind === 'glb' ? els.glb : els.ply;
-    const label = btn.textContent;
-    btn.textContent = 'Exporting…';
-    btn.disabled = true;
     setTimeout(() => {
       try {
         const blob = exportScene(kind);
-        if (blob) {
-          const a = document.createElement('a');
-          a.href = URL.createObjectURL(blob);
-          a.download = state.kind === 'temporal' ? `frame_t${state.t.toFixed(2)}s.${kind}` : `export.${kind}`;
-          a.click();
-          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        if (!blob) {
+          toast('Export is not available for streamed scenes');
+          return;
         }
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        const stem = (state.activeSceneId || state.sceneName || 'scene').replace(/\.[^.]+$/, '');
+        a.download = state.kind === 'temporal' ? `${stem}_t${state.t.toFixed(2)}s.${kind}` : `${stem}.${kind}`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+        toast(`Exported ${a.download}`);
       } catch (err) {
         showError(String(err.message || err));
-      } finally {
-        btn.textContent = label;
-        btn.disabled = false;
       }
-    }, 50);
+    }, 30);
   }
 
-  function updateXRButtons() {
+  function shareParams() {
+    const p = {};
+    if (state.kind === 'temporal') p.t = state.t.toFixed(3);
+    p.cam = encodeCam(state.cam);
+    if (!isIdentityXf(state.xf)) p.xf = encodeXf(state.xf);
+    if (state.fov !== DEFAULT_FOV) p.fov = String(Math.round(state.fov));
+    return p;
+  }
+
+  function shareUrl() {
+    const p = shareParams();
+    if (state.activeSceneId) return sceneHref(state.activeSceneId, p);
+    if (state.sourceUrl && !state.sourceUrl.startsWith('blob:')) return sceneHref(null, { scene: state.sourceUrl, ...p });
+    return null;
+  }
+
+  async function copyLink() {
+    const url = shareUrl();
+    if (!url) {
+      toast('A local file has no link — publish it to the site first');
+      return null;
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      toast('Link copied');
+    } catch {
+      toast('Copy failed — the link is in the console');
+      console.info('[4dviewer] share link:', url);
+    }
+    return url;
+  }
+
+  async function toggleFullscreen() {
+    const doc = root.ownerDocument;
+    const el = options.fullscreenElement || (cfg.route ? doc.documentElement : root);
+    try {
+      if (doc.fullscreenElement || doc.webkitFullscreenElement) await (doc.exitFullscreen || doc.webkitExitFullscreen).call(doc);
+      else await (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+    } catch (err) {
+      toast(`Fullscreen unavailable: ${err.message || err}`);
+    }
+  }
+
+  function xrOffer() {
     const streaming = !!state.temporalScene?.streaming;
-    if (cfg.xrDisabled || streaming || device.policy.offerXR === false || !state.caps) {
-      els.xrVr.classList.add('hidden');
-      els.xrAr.classList.add('hidden');
-    } else {
-      els.xrVr.classList.toggle('hidden', !state.caps.xr.immersiveVR);
-      els.xrAr.classList.toggle('hidden', !state.caps.xr.immersiveAR);
-    }
-    if (cfg.usdz) {
-      els.quickLook.href = cfg.usdz;
-      els.quickLook.classList.remove('hidden');
-    } else {
-      els.quickLook.classList.add('hidden');
-    }
+    const off = cfg.xrDisabled || streaming || device.policy.offerXR === false || !state.caps || !state.kind;
+    return { vr: !off && !!state.caps?.xr.immersiveVR, ar: !off && !!state.caps?.xr.immersiveAR };
   }
 
   async function enterXR(mode) {
@@ -936,8 +1044,9 @@ export function mountViewer(root, options = {}) {
       getTime: () => state.t,
       setTime: (t) => { state.t = t; },
       isPlaying: () => state.playing,
-    });
+    }, state.xf);
     state.xr = player;
+    menu?.close();
     await player.start(mode, {
       onEnd: () => {
         state.xr = null;
@@ -951,61 +1060,169 @@ export function mountViewer(root, options = {}) {
     emit('xrstart', { mode });
   }
 
+  // --- publishing (site owner) -------------------------------------------------------------
+
+  function sceneInfo() {
+    if (!state.kind) return null;
+    const s = state.kind === 'temporal' ? state.temporalScene : state.staticScene;
+    return {
+      name: state.sceneName || (state.sourceUrl ? sceneDisplayName(state.sourceUrl) : 'Scene'),
+      format: state.format,
+      formatLabel: formatLabel(state.format),
+      count: s.count,
+      duration: state.kind === 'temporal' ? s.duration : null,
+      shDegree: state.kind === 'temporal' ? s.shL : s.shDegree,
+      local: !!state.localFile,
+      credit: state.credit,
+    };
+  }
+
+  function publishEntry({ name, withXf, withCam }) {
+    const info = sceneInfo();
+    const entry = {
+      name,
+      format: state.format,
+      count: info.count,
+      duration: info.duration ? Math.round(info.duration * 1000) / 1000 : undefined,
+      transform: withXf ? xfToManifest(state.xf) : null,
+      cam: withCam ? {
+        yaw: +state.cam.yaw.toFixed(4), pitch: +state.cam.pitch.toFixed(4), roll: +state.cam.roll.toFixed(4),
+        dolly: +state.cam.dolly.toFixed(4), pan: state.cam.pan.map((v) => +v.toFixed(4)), fov: state.fov,
+      } : null,
+    };
+    if (state.credit) entry.credit = state.credit;
+    if (!state.localFile && state.activeSceneId) {
+      entry.file = state.manifest?.scenes?.find((s) => s.id === state.activeSceneId)?.file;
+    }
+    return entry;
+  }
+
+  function onPublished(id, url, entry) {
+    if (state.manifest && entry) {
+      const i = state.manifest.scenes.findIndex((s) => s.id === id);
+      if (i >= 0) state.manifest.scenes[i] = entry;
+      else state.manifest.scenes.push(entry);
+    }
+    state.activeSceneId = id;
+    state.localFile = null;
+    if (cfg.route) replaceAddress(id);
+    menu?.refresh();
+  }
+
   // --- wiring --------------------------------------------------------------------------------
 
   function wireUi() {
     const sig = { signal: aborter.signal };
-    root.addEventListener('dragover', (e) => e.preventDefault(), sig);
+    let depth = 0;
+    const hasFiles = (e) => Array.from(e.dataTransfer?.types ?? []).includes('Files');
+    root.addEventListener('dragenter', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      depth++;
+      els.dropzone.classList.remove('hidden');
+    }, sig);
+    root.addEventListener('dragover', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }, sig);
+    root.addEventListener('dragleave', (e) => {
+      if (!hasFiles(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) els.dropzone.classList.add('hidden');
+    }, sig);
     root.addEventListener('drop', (e) => {
       e.preventDefault();
+      depth = 0;
+      els.dropzone.classList.add('hidden');
       const f = e.dataTransfer?.files?.[0];
-      if (f) openFile(f);
+      if (f) {
+        menu?.close();
+        openFile(f);
+      }
     }, sig);
     els.pick.onclick = () => els.file.click();
-    els.open.onclick = () => els.file.click();
     els.file.onchange = () => {
       const f = els.file.files[0];
       els.file.value = '';
-      if (f) openFile(f);
-    };
-    els.help.onclick = () => {
-      const shown = els.hint.classList.toggle('shown');
-      els.help.setAttribute('aria-expanded', String(shown));
+      if (f) {
+        if (isNarrow()) menu?.close();
+        openFile(f);
+      }
     };
     els.play.onclick = () => {
       state.playing = !state.playing;
-      syncPlayButton();
+      syncHud();
       announce(state.playing ? 'Playing' : 'Paused');
       emit('playstate', { playing: state.playing });
     };
     els.scrub.oninput = () => {
       state.playing = false;
-      syncPlayButton();
+      syncHud();
       const d = state.kind === 'temporal' ? state.temporalScene.duration : 1;
       seekTo(Number(els.scrub.value) * d);
       els.scrub.setAttribute('aria-valuetext', `${state.t.toFixed(2)} of ${d.toFixed(2)} seconds`);
     };
-    els.mute.onclick = () => {
-      mutedOverride = !(state.audio ? state.audio.isMuted() : isMuted());
-      state.audio?.setMuted(mutedOverride);
-      syncMuteButton();
-      emit('audio', { muted: mutedOverride });
-    };
-    els.ply.onclick = () => download('ply');
-    els.glb.onclick = () => download('glb');
-    els.copyLink.onclick = async () => {
-      const url = handle.getShareUrl();
-      try {
-        await navigator.clipboard.writeText(url);
-        els.copyLink.textContent = 'Link copied';
-      } catch {
-        els.copyLink.textContent = 'Copy failed — see console';
-        console.info('[4dviewer] share link:', url);
-      }
-      setTimeout(() => { els.copyLink.textContent = 'Copy link to this view'; }, 1600);
-    };
-    els.xrVr.onclick = () => enterXR('immersive-vr').catch((err) => showError(String(err.message || err)));
-    els.xrAr.onclick = () => enterXR('immersive-ar').catch((err) => showError(String(err.message || err)));
+    els.mute.onclick = () => setMuted(!(state.audio ? state.audio.isMuted() : isMuted()));
+    const fsChange = () => menu?.renderView();
+    root.ownerDocument.addEventListener('fullscreenchange', fsChange, sig);
+    root.ownerDocument.addEventListener('webkitfullscreenchange', fsChange, sig);
+  }
+
+  function createMenuController() {
+    return createMenu({
+      root, $,
+      onToggle: (open) => {
+        markActive();
+        if (open) root.classList.remove('idle');
+      },
+      isNarrow,
+      sceneInfo,
+      sceneList: () => state.manifest?.scenes || [],
+      activeSceneId: () => state.activeSceneId,
+      selectScene: (id) => selectScene(id),
+      openPicker: () => els.file.click(),
+      copyLink,
+      getXf: () => cloneXf(state.xf),
+      setXf,
+      getCamera: () => {
+        const { center } = sceneBounds();
+        return { ...state.cam, fov: state.fov, target: [center[0] + state.cam.pan[0], center[1] + state.cam.pan[1], center[2] + state.cam.pan[2]] };
+      },
+      setCamera: (c) => {
+        for (const k of ['yaw', 'pitch', 'roll', 'dolly']) if (Number.isFinite(c[k])) state.cam[k] = c[k];
+        if (Number.isFinite(c.fov)) state.fov = Math.max(20, Math.min(110, c.fov));
+        if (Array.isArray(c.target)) {
+          const { center } = sceneBounds();
+          state.cam.pan = [c.target[0] - center[0], c.target[1] - center[1], c.target[2] - center[2]];
+        }
+        clampOrbit(state.cam, state.camLimits);
+        stopInertia();
+      },
+      resetView,
+      caps: () => state.caps,
+      xrOffer,
+      enterXR: (mode) => enterXR(mode).catch((err) => showError(String(err.message || err))),
+      toggleFullscreen,
+      statsShown: () => state.showStats,
+      setStats: (on) => {
+        state.showStats = !!on;
+        els.stats.classList.toggle('hidden', !on);
+        state.lastStatsAt = 0;
+        state.lastFrameKey = '';
+      },
+      hasAudio: () => !!state.audio,
+      isMuted: () => (state.audio ? state.audio.isMuted() : isMuted()),
+      setMuted,
+      qualityTier: () => state.qualityTier,
+      setQuality: (tier) => handle.setQualityTier(tier),
+      canExport: () => !!state.kind && !state.temporalScene?.streaming,
+      exportScene: download,
+      publishTarget: () => (typeof location !== 'undefined' ? repoFor(location, state.manifest) : null),
+      publishEntry,
+      localFile: () => state.localFile,
+      onPublished,
+    });
   }
 
   async function init() {
@@ -1016,35 +1233,44 @@ export function mountViewer(root, options = {}) {
     quality.maxScale = Math.min(quality.maxScale, device.policy.resolutionScale);
     quality.scale = Math.min(quality.scale, quality.maxScale);
     emit('ready', { capabilities: state.caps, device: { tier: device.tier, reasons: device.reasons } });
-    state.manifest = cfg.manifest || (await fetchManifest());
+    state.manifest = cfg.manifest || (await fetchManifest()) || { scenes: [] };
     if (destroyed) return;
-    if (cfg.scene) {
-      const entry = state.manifest?.scenes?.find((s) => cfg.scene === s.id || cfg.scene.endsWith(s.file));
-      if (entry) {
-        state.activeSceneId = entry.id;
-        state.camOverride = entry.cam || null;
-        state.camLimits = entry.limits || null;
-        setCredit(entry);
-        renderChips();
-        await loadUrl(sceneUrl(state.manifest, entry), entry.format || cfg.format, { up: entry.up ?? cfg.up });
+    menu.refresh();
+    const pathName = cfg.route && typeof location !== 'undefined' ? sceneFromPath(location) : null;
+    let ok = false;
+    if (pathName) {
+      const hit = resolveSceneName(pathName, state.manifest, MANIFEST_URL, detectFormatFromName);
+      if (hit?.entry) {
+        ok = await selectScene(hit.entry.id);
+      } else if (hit?.url) {
+        state.sceneName = sceneDisplayName(hit.url);
+        ok = await loadUrl(hit.url, cfg.format, { up: cfg.up });
       } else {
-        renderChips();
-        await loadUrl(new URL(cfg.scene, location.href).href, cfg.format, { up: cfg.up });
+        showError(`There is no scene called “${pathName}” on this site. Open the menu to pick one, or upload a file.`);
+        els.drop.classList.remove('loading');
       }
+    } else if (cfg.scene) {
+      const entry = state.manifest.scenes.find((s) => cfg.scene === s.id || cfg.scene.endsWith(`/${s.file}`) || cfg.scene === s.file);
+      if (entry) {
+        ok = await selectScene(entry.id);
+      } else {
+        state.sceneName = sceneDisplayName(cfg.scene);
+        ok = await loadUrl(new URL(cfg.scene, location.href).href, cfg.format, { up: cfg.up });
+      }
+    } else if (cfg.route && defaultSceneId()) {
+      ok = await selectScene(defaultSceneId());
     } else {
-      renderChips();
+      els.drop.classList.remove('loading');
     }
-    if (fromUrl && state.kind) {
+    if (ok && fromUrl && state.kind) {
       const link = parseDeepLink();
-      if (link.cam || link.t !== null) {
-        if (link.cam) {
-          Object.assign(state.cam, { yaw: link.cam.yaw, pitch: link.cam.pitch, roll: link.cam.roll, dolly: link.cam.dolly });
-          state.cam.pan = [...link.cam.pan];
-          clampOrbit(state.cam, state.camLimits);
-        }
-        if (link.t !== null) seekTo(link.t);
-        state.lastFrameKey = '';
+      if (link.cam) {
+        Object.assign(state.cam, { yaw: link.cam.yaw, pitch: link.cam.pitch, roll: link.cam.roll, dolly: link.cam.dolly });
+        state.cam.pan = [...link.cam.pan];
+        clampOrbit(state.cam, state.camLimits);
       }
+      if (link.t !== null) seekTo(link.t);
+      state.lastFrameKey = '';
     }
   }
 
@@ -1061,7 +1287,7 @@ export function mountViewer(root, options = {}) {
     state.glRenderer = null;
     state.kind = null;
     root.innerHTML = '';
-    root.classList.remove('tg4d', 'ui-min', 'narrow');
+    root.classList.remove('tg4d', 'ui-min', 'narrow', 'menu-open', 'idle');
   }
 
   // --- mount ---------------------------------------------------------------------------------
@@ -1071,20 +1297,20 @@ export function mountViewer(root, options = {}) {
   root.tabIndex = -1;
   root.innerHTML = TEMPLATE;
   Object.assign(els, {
-    gpu: $('gpu'), stats: $('stats'), sr: $('sr-status'), badge: $('format-badge'), scenes: $('scenes'),
-    drop: $('drop'), err: $('err'), pick: $('pick'), file: $('file'), hud: $('hud'), play: $('play'),
-    scrub: $('scrub'), time: $('time'), mute: $('mute'), open: $('open'), ply: $('ply'), glb: $('glb'),
-    help: $('help'), hint: $('hint'), progBar: $('prog-bar'), progText: $('prog-text'),
-    loadingTitle: $('loading-title'), xrVr: $('xr-vr'), xrAr: $('xr-ar'), quickLook: $('ar-quicklook'),
-    copyLink: $('copy-link'),
+    gpu: $('gpu'), stats: $('stats'), sr: $('sr-status'), drop: $('drop'), err: $('err'), pick: $('pick'),
+    file: $('file'), hud: $('hud'), play: $('play'), scrub: $('scrub'), time: $('time'), mute: $('mute'),
+    progBar: $('prog-bar'), progText: $('prog-text'), loadingTitle: $('loading-title'), dropzone: $('dropzone'),
+    toast: $('toast'),
   });
-  if (cfg.scene) showLoading(/\.nx(4d|s4)/i.test(cfg.scene) ? 'Streaming 4D scene' : 'Loading scene');
-  syncPlayButton();
+  els.stats.classList.toggle('hidden', !state.showStats);
+  menu = createMenuController();
+  if (cfg.scene || (cfg.route && typeof location !== 'undefined')) showLoading('Loading scene');
+  syncHud();
   attachPointer(els.gpu);
   attachKeys();
   wireUi();
   const onResize = () => {
-    root.classList.toggle('narrow', width() <= 640);
+    root.classList.toggle('narrow', isNarrow());
     state.lastFrameKey = '';
   };
   onResize();
@@ -1108,48 +1334,57 @@ export function mountViewer(root, options = {}) {
       state.activeSceneId = null;
       state.camOverride = null;
       state.camLimits = null;
-      setCredit(null);
-      renderChips();
+      state.credit = '';
+      state.localFile = null;
+      state.sceneName = sceneDisplayName(url);
+      menu.refresh();
       return loadUrl(url, format, opts);
     },
     openFile: (file) => openFile(file),
     destroy,
     play: () => {
       state.playing = true;
-      syncPlayButton();
+      syncHud();
       announce('Playing');
       emit('playstate', { playing: true });
     },
     pause: () => {
       state.playing = false;
-      syncPlayButton();
+      syncHud();
       announce('Paused');
       emit('playstate', { playing: false });
     },
     seek: (t) => {
       state.playing = false;
-      syncPlayButton();
+      syncHud();
       seekTo(t);
     },
     getPlayerState: playerState,
     setCam: (c) => {
       for (const k of ['yaw', 'pitch', 'roll', 'dolly']) if (Number.isFinite(c?.[k])) state.cam[k] = c[k];
       if (Array.isArray(c?.pan) && c.pan.length === 3) state.cam.pan = [...c.pan];
+      if (Number.isFinite(c?.fov)) state.fov = c.fov;
       clampOrbit(state.cam, state.camLimits);
     },
-    getCamera: () => ({ ...state.cam, pan: [...state.cam.pan] }),
-    resetView: () => { state.cam = initialCamera(); },
+    getCamera: () => ({ ...state.cam, pan: [...state.cam.pan], fov: state.fov }),
+    resetView,
+    setTransform: (xf) => {
+      setXf({ ...IDENTITY_XF, ...xf });
+      menu.renderXf();
+    },
+    getTransform: () => cloneXf(state.xf),
+    openMenu: () => menu.open(),
+    closeMenu: () => menu.close(),
     setQualityTier: (tier) => {
       const s = QUALITY_TIERS[tier];
       if (s === undefined) throw new Error(`setQualityTier: unknown tier "${tier}" (auto|low|medium|high)`);
       quality.maxScale = s;
       quality.scale = tier === 'auto' ? Math.min(quality.scale, s) : s;
+      state.qualityTier = tier;
       state.lastFrameKey = '';
     },
-    getShareUrl: (o = {}) => buildShareUrl({
-      base: o.base, scene: o.scene ?? state.activeSceneId ?? state.sourceUrl ?? cfg.scene ?? null,
-      t: state.kind === 'temporal' ? state.t : undefined, cam: state.cam, hotspot: o.hotspot ?? null,
-    }),
+    getShareUrl: () => shareUrl(),
+    copyLink,
     applyDeepLink: (search) => {
       const link = parseDeepLink(search);
       if (link.cam) {
@@ -1157,6 +1392,10 @@ export function mountViewer(root, options = {}) {
         state.cam.pan = [...link.cam.pan];
         clampOrbit(state.cam, state.camLimits);
       }
+      const q = new URLSearchParams(search);
+      const xf = decodeXf(q.get('xf'));
+      if (xf) setXf(xf);
+      if (Number(q.get('fov')) > 0) state.fov = Number(q.get('fov'));
       if (link.t !== null) seekTo(link.t);
       state.lastFrameKey = '';
       return link;
@@ -1179,8 +1418,8 @@ export function mountViewer(root, options = {}) {
     getHotspots: () => [...state.hotspots.values()],
     projectHotspots: () => {
       if (!state.kind) return [];
-      const { m } = currentView();
-      const vp = { width: width(), height: height(), fovY: FOV_Y };
+      const { m } = frameView();
+      const vp = { width: width(), height: height(), fovY: fovRad() };
       return [...state.hotspots.values()]
         .filter((h) => state.t >= h.tStart && state.t <= h.tEnd)
         .map((h) => ({ h, p: projectPoint(m, h.position, vp) }))
@@ -1206,21 +1445,6 @@ export function mountViewer(root, options = {}) {
       for (const c of state.chapters) if (c.t <= state.t + 1e-9) cur = c;
       return cur ?? state.chapters[0] ?? null;
     },
-    setPlaylist: (items) => {
-      state.playlist = { items: [...(items ?? [])], index: items?.length ? 0 : -1 };
-      return state.playlist.items[state.playlist.index] ?? null;
-    },
-    getPlaylist: () => ({ items: [...state.playlist.items], index: state.playlist.index }),
-    next: async ({ loop = false } = {}) => {
-      const pl = state.playlist;
-      if (pl.index < 0) return null;
-      if (pl.index + 1 < pl.items.length) pl.index++;
-      else if (loop) pl.index = 0;
-      else return null;
-      const item = pl.items[pl.index];
-      await loadUrl(item.scene, item.format, { up: item.up });
-      return item;
-    },
     validateFile: (file) => validateFile(file),
     getCapabilities: () => state.caps,
     getPolicy: () => ({ signals: { ...env }, budget: { ...budget }, device: { ...device } }),
@@ -1233,13 +1457,7 @@ export function mountViewer(root, options = {}) {
         space: { min: [c[0] - r, c[1] - r, c[2] - r], max: [c[0] + r, c[1] + r, c[2] + r] },
       };
     },
-    setMuted: (m) => {
-      mutedOverride = !!m;
-      state.audio?.setMuted(mutedOverride);
-      syncMuteButton();
-      emit('audio', { muted: mutedOverride });
-      return mutedOverride;
-    },
+    setMuted,
     isMuted: () => (state.audio ? state.audio.isMuted() : isMuted()),
     getAudioStats: () => state.audio?.stats() ?? null,
     enterXR: (mode) => enterXR(mode),
@@ -1261,25 +1479,8 @@ export function mountViewer(root, options = {}) {
       ctx.drawImage(canvas, 0, 0, out.width, out.height);
       return new Promise((resolve, reject) => out.toBlob((b) => (b ? resolve(b) : reject(new Error('encode failed'))), type, q));
     },
-    captureClip: async ({ fps = 30, durationMs = 5000 } = {}) => {
-      const canvas = state.usingGpu ? els.gpu : els.gl;
-      if (!canvas || typeof MediaRecorder === 'undefined') throw new Error('clip capture is unavailable in this browser');
-      const mime = ['video/mp4;codecs=avc1.42E01E', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm']
-        .find((m) => MediaRecorder.isTypeSupported?.(m));
-      if (!mime) throw new Error('MediaRecorder supports none of the video types this viewer can produce');
-      const stream = canvas.captureStream(fps);
-      const rec = new MediaRecorder(stream, { mimeType: mime });
-      const parts = [];
-      rec.ondataavailable = (e) => e.data?.size && parts.push(e.data);
-      const done = new Promise((resolve) => { rec.onstop = resolve; });
-      rec.start(200);
-      await new Promise((r) => setTimeout(r, Math.min(durationMs, 60000)));
-      rec.stop();
-      stream.getTracks().forEach((t) => t.stop());
-      await done;
-      return new Blob(parts, { type: mime });
-    },
     getState: () => state,
   };
   return handle;
 }
+

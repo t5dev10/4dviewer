@@ -7,6 +7,7 @@
 // surface. Both: two-hand pinch scales, thumbsticks turn and scale.
 
 import { multiplyRowMajor, transposeToColumnMajor } from '../core/camera.js';
+import { IDENTITY_XF, applyXf, modelMatrix } from '../core/transform.js';
 
 const FLIP_YZ = Float32Array.from([1, 0, 0, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0, 0, 0, 1]);
 
@@ -15,17 +16,18 @@ function percentile(values, q) {
   return s[Math.min(s.length - 1, Math.max(0, Math.floor(q * s.length)))] ?? 0;
 }
 
-// Scene extents along its own axes, sampled.
-function sceneExtent(scene) {
+// Extents of the placed scene (viewer frame, +y down), sampled.
+function sceneExtent(scene, xf) {
   const n = scene.count;
   const stride = Math.max(1, Math.floor(n / 50000));
   const xs = [], ys = [], zs = [];
   const P = scene.kind === 'temporal' ? scene.geo : scene.positions;
   const w = scene.kind === 'temporal' ? 16 : 3;
   for (let i = 0; i < n; i += stride) {
-    xs.push(P[i * w]);
-    ys.push(P[i * w + 1]);
-    zs.push(P[i * w + 2]);
+    const p = applyXf(xf, [P[i * w], P[i * w + 1], P[i * w + 2]]);
+    xs.push(p[0]);
+    ys.push(p[1]);
+    zs.push(p[2]);
   }
   return {
     centre: [percentile(xs, 0.5), percentile(ys, 0.5), percentile(zs, 0.5)],
@@ -45,10 +47,12 @@ function rayFloor(origin, dir, floorY = 0, maxDist = 30) {
 }
 
 export class XRPlayer {
-  constructor(renderer, scene, clock) {
+  constructor(renderer, scene, clock, xf = IDENTITY_XF) {
     this.renderer = renderer;
     this.scene = scene;
     this.clock = clock;
+    this.xf = xf;
+    this.placement = modelMatrix(xf);
     this.session = null;
     this.refSpace = null;
     this.baseRefSpace = null;
@@ -59,7 +63,7 @@ export class XRPlayer {
     this.pinch = null;
     this.sortInFlight = false;
     this.lastTime = 0;
-    const ext = sceneExtent(scene);
+    const ext = sceneExtent(scene, xf);
     this.extent = ext;
     // Unknown units: assume metres unless the scene is implausibly small or big.
     const height = Math.abs(ext.bottom - ext.top) || 1;
@@ -75,7 +79,7 @@ export class XRPlayer {
     }
   }
 
-  // Scene -> XR world, row-major: translate(anchor) · rotY(yaw) · scale · flip(y, z) · translate(-feet).
+  // Placed scene -> XR world, row-major: translate(anchor) · rotY(yaw) · scale · flip(y, z) · translate(-feet).
   modelMatrix() {
     const s = this.baseScale * this.scale;
     const c = Math.cos(this.yaw), sn = Math.sin(this.yaw);
@@ -95,7 +99,7 @@ export class XRPlayer {
       m[r * 4 + 3] = this.anchor[r] - s * (RF[r * 3] * feet[0] + RF[r * 3 + 1] * feet[1] + RF[r * 3 + 2] * feet[2]);
     }
     m[15] = 1;
-    return m;
+    return multiplyRowMajor(m, this.placement);
   }
 
   sceneFromWorld(p, m) {

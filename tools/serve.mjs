@@ -32,6 +32,7 @@ const MIME = {
   '.jpg': 'image/jpeg', '.webp': 'image/webp', '.ico': 'image/x-icon', '.txt': 'text/plain; charset=utf-8',
   '.md': 'text/markdown; charset=utf-8', '.glb': 'model/gltf-binary', '.gltf': 'model/gltf+json',
   '.usdz': 'model/vnd.usdz+zip', '.wasm': 'application/wasm', '.ogg': 'audio/ogg', '.mp3': 'audio/mpeg',
+  '.webmanifest': 'application/manifest+json',
 };
 
 function resolve(urlPath) {
@@ -63,7 +64,15 @@ const server = http.createServer((req, res) => {
       st = fs.statSync(file);
     }
   } catch {
-    res.writeHead(404, { 'Content-Type': 'text/plain' }).end('not found');
+    // Like GitHub Pages: unknown paths get the site's 404.html (the app,
+    // which then opens /<scene>), with a 404 status.
+    const fallback = path.join(opts.root, '404.html');
+    if (fs.existsSync(fallback)) {
+      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+      fs.createReadStream(fallback).pipe(res);
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/plain' }).end('not found');
+    }
     return;
   }
   const headers = {
