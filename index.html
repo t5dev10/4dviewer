@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>4D Viewer — live 4D Gaussian splatting in your browser</title>
+<meta name="description" content="Orbit a moving 4D Gaussian-splat scene, scrub its timeline, and open your own .nx4d, .nxs4, .ply, .spz, .sog, .glb, .splat, .ksplat or .usdz file — decoded on your device, never uploaded." />
+<meta name="theme-color" content="#08090c" />
+<meta name="color-scheme" content="dark" />
+<meta property="og:title" content="4D Viewer — live 4D Gaussian splatting" />
+<meta property="og:description" content="Orbit a moving volumetric scene in the browser, then open one of your own. Files are read locally, never uploaded." />
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+<link rel="stylesheet" href="assets/site.css" />
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="nav">
+  <a class="brand" href="./" aria-label="4D Viewer home">
+    <img src="assets/favicon.svg" alt="" width="28" height="28" />
+    <span>4D Viewer</span><small>by TableGo</small>
+  </a>
+  <nav aria-label="Sections">
+    <a href="#formats">Formats</a>
+    <a href="#how">How it works</a>
+    <a href="#embed">Embed</a>
+    <a class="cta" href="viewer/" target="_blank" rel="noopener">Full-screen viewer ↗</a>
+  </nav>
+</header>
+
+<main id="main">
+  <section class="hero">
+    <p class="eyebrow">Live 4D Gaussian splatting · WebGL2 &amp; WebGPU</p>
+    <h1>Scrub time. Orbit space.</h1>
+    <p class="lede">The scene below is a moving 4D model, not a video. Drag to orbit, scroll to zoom, scrub the timeline —
+      and when you have a scene of your own, drop it here. It is decoded by this tab and never leaves your device.</p>
+
+    <div class="frame-wrap" id="frame">
+      <div class="poster" id="poster" aria-hidden="true"><span class="pulse"></span></div>
+      <div class="mount" id="mount"></div>
+      <div class="fallback hidden" id="fallback" role="alert">
+        <h3>The live viewer didn’t respond</h3>
+        <p>It may still be loading a large scene, or this browser blocked it. Retry, or open it in its own tab.</p>
+        <p><button type="button" id="retry">Retry</button> <a class="btn secondary" href="viewer/?scene=lumen" target="_blank" rel="noopener">Open in new tab</a></p>
+      </div>
+    </div>
+
+    <div class="chips" id="chips" role="tablist" aria-label="Demo scenes"></div>
+    <p class="credit" id="credit"></p>
+    <div class="status" id="status" aria-live="polite">
+      <span class="checking" id="checking">Viewer loads when scrolled into view</span>
+      <span class="badges" id="badges"></span>
+    </div>
+    <p class="legend" id="legend"></p>
+
+    <div class="panel" id="panel">
+      <div class="panel-head">
+        <span class="panel-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke-linecap="round"/></svg>
+        </span>
+        <div>
+          <h2>Open your own scene</h2>
+          <p>Drop a file anywhere on this page, or pick one. It opens in the viewer above.</p>
+        </div>
+      </div>
+      <div class="panel-actions">
+        <label for="local-file" class="pick">Choose a file…</label>
+        <input id="local-file" type="file" accept=".nx4d,.nxs4,.ply,.spz,.sog,.gltf,.glb,.splat,.ksplat,.usdz,.usda" />
+        <span class="accepts"><code>.nx4d</code> <code>.ply</code> <code>.spz</code> <code>.sog</code> <code>.glb</code> <code>.splat</code> <code>.ksplat</code> <code>.usdz</code></span>
+      </div>
+      <p class="privacy"><span aria-hidden="true">🔒</span> <strong>Nothing is uploaded.</strong> The file is read by this tab and decoded by the viewer’s
+        own workers on your machine. There is no upload endpoint and no copy kept — close the tab and it is gone.</p>
+      <div class="local-status" id="local-status" role="status" aria-live="polite"></div>
+    </div>
+  </section>
+
+  <section class="band">
+    <h2>It opens your file. It never takes it.</h2>
+    <div class="cards four">
+      <article><h3>No upload endpoint</h3><p>This site is static files. The viewer is a set of ES modules running in your tab, so a scene has nowhere to be sent.</p></article>
+      <article><h3>Read from a local handle</h3><p>Your pick becomes a browser-local object URL. The viewer streams from it exactly as it would from the network, progress bar and all.</p></article>
+      <article><h3>Checked before it loads</h3><p>Only the first few kilobytes are read first, with every count bounds-checked, so a file that cannot open gets a sentence you can act on.</p></article>
+      <article><h3>Gone when the tab is</h3><p>Nothing is cached server-side, and the local handle is released as soon as decoding ends.</p></article>
+    </div>
+  </section>
+
+  <section class="band" id="formats">
+    <h2>What it opens</h2>
+    <p class="sub">The view column is a live capability check run in your browser. Only the 4D containers keep time; everything else is a single frame.</p>
+    <div class="table-wrap">
+      <table class="formats">
+        <thead><tr><th>Format</th><th>View</th><th>Export</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr data-f="nx4d"><td><code>.nx4d</code> 4D scene</td><td class="lvl"></td><td>PLY or GLB of any moment</td><td>The whole moving scene in one gzip container: motion, temporal opacity, view- and time-dependent colour.</td></tr>
+          <tr data-f="nxs4"><td><code>.nxs4</code> 4D stream</td><td class="lvl"></td><td>—</td><td>Streams over HTTP ranges: a coarse layer paints first, detail chunks arrive by time and view. Can carry audio.</td></tr>
+          <tr data-f="ply"><td><code>.ply</code></td><td class="lvl"></td><td>PLY / GLB</td><td>Reference 3DGS layout (SH up to degree 3) and the PlayCanvas compressed variant.</td></tr>
+          <tr data-f="spz"><td><code>.spz</code></td><td class="lvl"></td><td>PLY / GLB</td><td>Niantic SPZ v1–v4 (gzip or per-attribute zstd streams).</td></tr>
+          <tr data-f="sog"><td><code>.sog</code> / <code>meta.json</code></td><td class="lvl"></td><td>PLY / GLB</td><td>PlayCanvas SOG v1 and v2, bundled or unbundled (unbundled needs a URL).</td></tr>
+          <tr data-f="gltf"><td><code>.glb</code> / <code>.gltf</code></td><td class="lvl"></td><td>PLY / GLB</td><td>Khronos <code>KHR_gaussian_splatting</code>, including node transforms.</td></tr>
+          <tr data-f="splat"><td><code>.splat</code></td><td class="lvl"></td><td>PLY / GLB</td><td>32-byte records: static, DC colour only.</td></tr>
+          <tr data-f="ksplat"><td><code>.ksplat</code></td><td class="lvl"></td><td>PLY / GLB</td><td>GaussianSplats3D, compression levels 0–2, SH up to degree 2.</td></tr>
+          <tr data-f="usdz"><td><code>.usdz</code> / <code>.usda</code></td><td class="lvl"></td><td>PLY / GLB</td><td>ASCII OpenUSD <code>ParticleField3DGaussianSplat</code>; a binary crate is refused with the command that converts it.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="band" id="how">
+    <h2>How it renders</h2>
+    <div class="cards">
+      <article><h3>One clock drives everything</h3><p>A moving scene is one continuous model evaluated at a single time value in the shader — positions move along each splat’s velocity, opacity follows its temporal gate, colour follows spherical harmonics × a Fourier series in time. Audio is slaved to the same clock.</p></article>
+      <article><h3>Adaptive resolution, never adaptive truth</h3><p>When a device cannot hold the frame rate, render resolution drops and climbs back when it can. Splats are not thrown away to keep up.</p></article>
+      <article><h3>WebGL2 by default, WebGPU on request</h3><p>WebGL2 is the path everywhere. Add <code>?gpu=1</code> to sort and draw with WebGPU compute where the browser genuinely reports an adapter.</p></article>
+      <article><h3>It stops when you are not looking</h3><p>Scroll the viewer off screen and it pauses; scroll back and it resumes. Frames that would not change are not redrawn.</p></article>
+    </div>
+  </section>
+
+  <section class="band">
+    <h2>From 2D to immersive</h2>
+    <ol class="steps">
+      <li><strong>Default.</strong> The scene renders inline: orbit, pan, zoom, scrub.</li>
+      <li><strong>Feature detection.</strong> WebXR <code>immersive-vr</code> and <code>immersive-ar</code> are checked separately; a button appears only for a mode your device supports.</li>
+      <li><strong>Immersive.</strong> The session starts inside your click. The scene stands upright on the floor in front of you; in VR select the floor to teleport, in AR select a surface to place it, pinch with both hands to scale.</li>
+      <li><strong>Back to 2D.</strong> Ending the session returns to the inline view where you left it.</li>
+    </ol>
+  </section>
+
+  <section class="band" id="embed">
+    <h2>Share and embed</h2>
+    <p class="sub">The viewer is a set of plain ES modules — no build step. Every view can be a link.</p>
+    <div class="code-grid">
+      <div>
+        <h3>A link to a moment</h3>
+        <pre><code>viewer/?scene=lumen&amp;t=2.500&amp;cam=…</code></pre>
+        <p>The <em>Copy link to this view</em> button in the viewer’s help panel writes the time and camera into the URL.</p>
+      </div>
+      <div>
+        <h3>An iframe</h3>
+        <pre><code>&lt;iframe src="https://YOUR-SITE/viewer/?scene=URL&amp;ui=min"
+  allow="xr-spatial-tracking; fullscreen"&gt;&lt;/iframe&gt;</code></pre>
+      </div>
+      <div>
+        <h3>The module</h3>
+        <pre><code>import { mountViewer } from './viewer/js/index.js';
+const viewer = mountViewer(el, {
+  scene: 'scenes/my.nx4d',
+  onEvent: (type, data) =&gt; console.log(type, data),
+});
+viewer.seek(1.5);</code></pre>
+      </div>
+    </div>
+    <p class="sub">Query options: <code>scene</code>, <code>format</code>, <code>t</code>, <code>cam</code>, <code>yaw</code>/<code>pitch</code>/<code>roll</code>/<code>dolly</code>,
+      <code>up=z</code>, <code>ui=min</code>, <code>gpu=1</code>, <code>sh=0…3</code>, <code>muted=0</code>, <code>xr=0</code>, <code>perf=full</code>, <code>pool=N</code>.</p>
+  </section>
+</main>
+
+<footer class="foot">
+  <p><strong>4D Viewer</strong> · TableGo — every byte is decoded in your browser.</p>
+  <p><a href="viewer/" target="_blank" rel="noopener">Full-screen viewer</a> · <a id="source-link" href="https://github.com/t5dev10/4dviewer" target="_blank" rel="noopener">Source</a></p>
+</footer>
+
+<div class="drop-overlay hidden" id="drop-overlay" aria-hidden="true"><span>Drop to open</span></div>
+<script type="module" src="assets/site.js"></script>
+</body>
+</html>

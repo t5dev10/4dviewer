@@ -1,0 +1,10 @@
+{
+  "name": "4dviewer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Browser viewer for 4D Gaussian-splat scenes (.nx4d, .nxs4) and static splat formats.",
+  "type": "module",
+  "scripts": {
+    "serve": "node tools/serve.mjs"
+  }
+}
