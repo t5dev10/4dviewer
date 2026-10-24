@@ -85,7 +85,7 @@ struct U {
   shB: u32,
   motion: u32,
   count: u32,
-  pad0: u32,
+  antialiased: u32,
   pad1: u32,
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -153,10 +153,13 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut 
     vec3f(geo[g + 10u], geo[g + 12u], geo[g + 13u]));
   let VS = W * S * transpose(W);
   let iz = 1.0 / v.z;
+  // Slope taken at most 1.3 half fields of view off axis, as in 3DGS and gsplat.
+  let margin = 0.15 * u.viewport / u.focal;
+  let ray = clamp(v.xy * iz, -u.principal / u.focal - margin, (u.viewport - u.principal) / u.focal + margin);
   let j00 = u.focal.x * iz;
-  let j02 = -u.focal.x * v.x * iz * iz;
+  let j02 = -u.focal.x * ray.x * iz;
   let j11 = u.focal.y * iz;
-  let j12 = -u.focal.y * v.y * iz * iz;
+  let j12 = -u.focal.y * ray.y * iz;
   let u0 = j00 * VS[0][0] + j02 * VS[2][0];
   let u1 = j00 * VS[0][1] + j02 * VS[2][1];
   let u2 = j00 * VS[0][2] + j02 * VS[2][2];
@@ -165,7 +168,10 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut 
   let c0 = j11 * (j11 * VS[1][1] + j12 * VS[2][1]) + j12 * (j11 * VS[1][2] + j12 * VS[2][2]);
   let a = a0 + 0.3;
   let c = c0 + 0.3;
-  alpha = alpha * sqrt(max((a0 * c0 - b * b) / max(a * c - b * b, 1e-12), 2.5e-5));
+  if (u.antialiased == 1u) { alpha = alpha * sqrt(max((a0 * c0 - b * b) / max(a * c - b * b, 1e-12), 2.5e-5)); }
+  // Out to where it fades below 1/255, 3.33 sigma at most (gsplat's extent).
+  if (alpha < 1.0 / 255.0) { return culled(); }
+  let ext = min(3.33, sqrt(2.0 * log(alpha * 255.0)));
   let mid = 0.5 * (a + c);
   let disc = sqrt(max(mid * mid - (a * c - b * b), 1e-9));
   let l1 = mid + disc;
@@ -173,8 +179,8 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut 
   var e1 = normalize(vec2f(b, l1 - a));
   if (abs(b) < 1e-9) { e1 = select(vec2f(0.0, 1.0), vec2f(1.0, 0.0), a >= c); }
   let e2 = vec2f(-e1.y, e1.x);
-  let r1 = min(3.0 * sqrt(l1) * reveal, u.maxR);
-  let r2 = min(3.0 * sqrt(l2) * reveal, u.maxR);
+  let r1 = min(ext * sqrt(l1) * reveal, u.maxR);
+  let r2 = min(ext * sqrt(l2) * reveal, u.maxR);
   let corner = vec2f(f32(vi & 1u) * 2.0 - 1.0, f32(vi >> 1u) * 2.0 - 1.0);
   let centre = vec2f(u.focal.x * v.x * iz, u.focal.y * v.y * iz) + u.principal;
   let px = centre + corner.x * r1 * e1 + corner.y * r2 * e2;
@@ -219,17 +225,16 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut 
   }
   var o: VOut;
   o.pos = vec4f(px.x / u.viewport.x * 2.0 - 1.0, 1.0 - px.y / u.viewport.y * 2.0, 0.0, 1.0);
-  o.local = corner * 3.0;
-  o.rgba = vec4f(clamp(rgb + vec3f(0.5), vec3f(0.0), vec3f(1.0)), alpha);
+  o.local = corner * ext;
+  // Only negative colour is clipped, as in 3DGS and gsplat.
+  o.rgba = vec4f(max(rgb + vec3f(0.5), vec3f(0.0)), alpha);
   return o;
 }
 
 @fragment
 fn fs(i: VOut) -> @location(0) vec4f {
-  let r2 = dot(i.local, i.local);
-  if (r2 > 9.0) { discard; }
-  let alpha = i.rgba.a * exp(-0.5 * r2);
-  if (alpha < 0.0039) { discard; }
+  let alpha = min(0.999, i.rgba.a * exp(-0.5 * dot(i.local, i.local)));
+  if (alpha < 1.0 / 255.0) { discard; }
   return vec4f(i.rgba.rgb * alpha, alpha);
 }
 `;
@@ -314,6 +319,7 @@ export class WebGPUSplatRenderer {
     this.revealInvRadius = 0;
     this.revealWidth = 0;
     this.overdrawClamp = 1.5;
+    this.antialiased = true;
     this.onSorted = null;
     this.onDeviceLost = null;
     device.lost.then((info) => {
@@ -458,6 +464,7 @@ export class WebGPUSplatRenderer {
     u[35] = this.shB;
     u[36] = this.motion;
     u[37] = this.count;
+    u[38] = this.antialiased === false ? 0 : 1;
     this.device.queue.writeBuffer(this.uniBuf, 0, raw);
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginRenderPass({

@@ -64,7 +64,7 @@ export function mountViewer(root, options = {}) {
   const cfg = fromUrl ? parseUrlConfig() : {
     scene: options.scene ?? null, format: options.format ?? null, up: options.up ?? null, gpu: options.gpu ?? null,
     perf: options.perf ?? null, uiMin: !!options.minimalUi, usdz: options.usdz ?? null, xrDisabled: !!options.xrDisabled,
-    pool: options.pool ?? null, muted: options.muted ?? null, sh: options.sh ?? null,
+    pool: options.pool ?? null, muted: options.muted ?? null, sh: options.sh ?? null, raster: options.raster ?? null,
     dolly: options.dolly ?? null, yaw: options.yaw ?? null, pitch: options.pitch ?? null, roll: options.roll ?? null,
   };
   cfg.manifest = options.manifest || null;
@@ -94,7 +94,8 @@ export function mountViewer(root, options = {}) {
     glRenderer: null, gpuRenderer: null, usingGpu: false, webgpuDead: false,
     sortWorker: null, sortGen: 0, sortInFlight: false, sortEpoch: 0, sortSentAt: 0, sortRtt: 0, orderT: NaN,
     lastFrameKey: '', lastSortKey: '', lastStatsAt: 0, showStats: query.get('stats') === '1',
-    caps: null, manifest: null, activeSceneId: null, sceneName: '', credit: '', localFile: null,
+    caps: null, manifest: null, activeSceneId: null, sceneName: '', credit: '', raster: null, colorSpace: null,
+    localFile: null,
     stream: null, streamController: null, audio: null, xr: null, qualityTier: 'auto',
     quality, budget, env, hotspots: new Map(), chapters: [], playlist: { items: [], index: -1 },
     draws: 0, lastVerdict: null,
@@ -108,6 +109,8 @@ export function mountViewer(root, options = {}) {
   const width = () => root.clientWidth || 1;
   const height = () => root.clientHeight || 1;
   const fovRad = () => toRad(state.fov);
+  // Scenes trained with gsplat's "classic" rasteriser skip the low-pass opacity compensation.
+  const antialiased = () => (cfg.raster || state.raster) !== 'classic';
 
   // --- small UI helpers -------------------------------------------------------
 
@@ -478,6 +481,7 @@ export function mountViewer(root, options = {}) {
     let drawn = 0;
     if (state.usingGpu && state.gpuRenderer) {
       state.gpuRenderer.grow = state.grow;
+      state.gpuRenderer.antialiased = antialiased();
       if (needSort) {
         state.lastSortKey = sortKey;
         state.gpuRenderer.requestSort(view.m, state.t);
@@ -496,6 +500,8 @@ export function mountViewer(root, options = {}) {
         });
       }
       r.grow = state.grow;
+      r.antialiased = antialiased();
+      r.setColorSpace(state.colorSpace || r.preferredColorSpace);
       r.time = drawTime();
       r.clear();
       r.render(view.m, { fx: f, fy: f, cx: W / 2, cy: H / 2 }, { x: 0, y: 0, width: W, height: H }, view.eyeLocal);
@@ -926,6 +932,8 @@ export function mountViewer(root, options = {}) {
     state.camOverride = null;
     state.camLimits = null;
     state.credit = '';
+    state.raster = null;
+    state.colorSpace = null;
     state.sceneName = file.name;
     state.localFile = file;
     if (!state.xfFromUrl) state.xf = cloneXf(IDENTITY_XF);
@@ -971,6 +979,8 @@ export function mountViewer(root, options = {}) {
     state.camOverride = keepView ? state.camOverride : (entry.cam || null);
     state.camLimits = entry.limits || null;
     state.credit = entry.credit || '';
+    state.raster = entry.raster || null;
+    state.colorSpace = entry.colorSpace || null;
     state.sceneName = entry.name || entry.id;
     state.localFile = null;
     if (!state.xfFromUrl) state.xf = cloneXf(xfFromManifest(entry.transform) || IDENTITY_XF);
@@ -1368,6 +1378,8 @@ export function mountViewer(root, options = {}) {
       state.camOverride = null;
       state.camLimits = null;
       state.credit = '';
+      state.raster = null;
+      state.colorSpace = null;
       state.localFile = null;
       state.sceneName = sceneDisplayName(url);
       menu.refresh();

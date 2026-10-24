@@ -59,6 +59,12 @@ route handles files up to 70 MB.
 }
 ```
 
+Splats are drawn with a 0.3 px² low-pass and, by default, the opacity compensation that antialiased training
+(Mip-Splatting, gsplat `rasterize_mode="antialiased"`) bakes into a model. A scene trained with the classic
+rasteriser (3DGS, gsplat `"classic"`) sets `"raster": "classic"` in its entry, or it is drawn too faint.
+On wide-gamut screens the canvas is display-p3 by default, which shows sRGB colours more saturated than they are;
+a scene trained on ordinary (sRGB) photos or video sets `"colorSpace": "srgb"` to be shown as captured.
+
 How `/<scene>` works on a static host: `index.html` is the app; `404.html` is a copy of it (GitHub Pages serves
 that for unknown paths, so any name reaches the app with a 404 status); `<id>/index.html` gives listed scenes a
 real page (status 200, link previews). `tools/build_pages.mjs` regenerates both.
@@ -90,6 +96,7 @@ The dev server answers byte ranges (for `.nxs4`) and falls back to `404.html` li
 | `xr=0` | Never offer VR/AR |
 | `perf=full` | Do not drop to the software-rasteriser performance mode |
 | `pool=N` | Streaming pool capacity in splats |
+| `raster=classic` | Draw without the low-pass opacity compensation (see `raster` above); `raster=antialiased` forces it |
 
 Keys: W/A/S/D move · E/Q up/down (Shift faster) · Space play/pause · R reset view · M menu · Esc close menu.
 

@@ -104,6 +104,7 @@ export function parseUrlConfig(search = typeof location !== 'undefined' ? locati
     pool: q.has('pool') ? parseInt(q.get('pool'), 10) : null,
     muted: q.has('muted') ? q.get('muted') !== '0' : null,
     sh: q.has('sh') ? parseInt(q.get('sh'), 10) : null,
+    raster: q.get('raster') || null,
     dolly: num('dolly'),
     yaw: num('yaw'),
     pitch: num('pitch'),

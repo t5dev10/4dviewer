@@ -12,8 +12,10 @@ export function applyRendererPolicy(q, cfg, { usingGpu, glRenderer, gpuRenderer 
     q.scale = 0.5;
     q.splatCap = 150000;
   }
-  if (glRenderer) glRenderer.overdrawClamp = q.software ? 0.15 : 1.5;
-  if (gpuRenderer) gpuRenderer.overdrawClamp = 1.5;
+  // On a GPU every splat keeps its true footprint, as in gsplat (the screen clips it anyway; capping squashed the
+  // few huge ones and darkened what shows through them); a software rasteriser gets small ones.
+  if (glRenderer) glRenderer.overdrawClamp = q.software ? 0.15 : 1e6;
+  if (gpuRenderer) gpuRenderer.overdrawClamp = 1e6;
 }
 
 export function updateQuality(q, now, gapMs, splatCount) {

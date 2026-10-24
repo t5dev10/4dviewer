@@ -1,5 +1,5 @@
 // Depth sort for 4D scenes: positions are evaluated at the requested time,
-// then a 16-bit counting sort orders splats back to front.
+// then a radix sort on the exact float depth orders splats back to front.
 //
 // Splats that cannot be visible near t are left out of the order list, so the
 // GPU never touches them: a time index (buckets over the clip) lists which
@@ -21,26 +21,39 @@ const CUT = 1 / 255;
 const EXT = 4;
 const POSE = 8;
 
+// Two 16-bit counting passes over the float's bits, flipped so that ascending
+// keys run far to near. Exact, so a few far-off splats cannot coarsen the order
+// of everything else the way quantising the whole depth range did.
 function countingSort(depth, ids, n) {
-  let lo = Infinity, hi = -Infinity;
+  const bits = new Uint32Array(depth.buffer, depth.byteOffset, n);
+  const keys = new Uint32Array(n);
   for (let i = 0; i < n; ++i) {
-    const d = depth[i];
-    if (d < lo) lo = d;
-    if (d > hi) hi = d;
+    const b = bits[i];
+    keys[i] = b & 0x80000000 ? b : b ^ 0x7fffffff;
   }
-  const scale = 65535 / Math.max(hi - lo, 1e-9);
-  const keys = new Uint16Array(n);
   const counts = new Uint32Array(65536);
-  for (let i = 0; i < n; ++i) {
-    const k = 65535 - Math.min(65535, Math.max(0, Math.round((depth[i] - lo) * scale)));
-    keys[i] = k;
-    counts[k]++;
+  for (let i = 0; i < n; ++i) counts[keys[i] & 0xffff]++;
+  for (let k = 0, sum = 0; k < 65536; ++k) {
+    const c = counts[k];
+    counts[k] = sum;
+    sum += c;
   }
-  const starts = new Uint32Array(65536);
-  for (let k = 1; k < 65536; ++k) starts[k] = starts[k - 1] + counts[k - 1];
+  const midKeys = new Uint32Array(n);
+  const midIds = new Uint32Array(n);
+  for (let i = 0; i < n; ++i) {
+    const p = counts[keys[i] & 0xffff]++;
+    midKeys[p] = keys[i];
+    midIds[p] = ids ? ids[i] : i;
+  }
+  counts.fill(0);
+  for (let i = 0; i < n; ++i) counts[midKeys[i] >>> 16]++;
+  for (let k = 0, sum = 0; k < 65536; ++k) {
+    const c = counts[k];
+    counts[k] = sum;
+    sum += c;
+  }
   const out = new Uint32Array(n);
-  if (ids) for (let i = 0; i < n; ++i) out[starts[keys[i]]++] = ids[i];
-  else for (let i = 0; i < n; ++i) out[starts[keys[i]]++] = i;
+  for (let i = 0; i < n; ++i) out[counts[midKeys[i] >>> 16]++] = midIds[i];
   return out;
 }
 

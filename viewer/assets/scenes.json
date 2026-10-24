@@ -79,6 +79,8 @@
       "sizeMB": 60.7,
       "count": 395232,
       "duration": 10,
+      "raster": "classic",
+      "colorSpace": "srgb",
       "tags": [
         "Neural 3D Video (N3DV), 21 cameras",
         "FreeTimeGS++ 4D reconstruction",
@@ -97,6 +99,8 @@
       "sizeMB": 74.9,
       "count": 487166,
       "duration": 5,
+      "raster": "classic",
+      "colorSpace": "srgb",
       "tags": [
         "CMU Panoptic dome, 31 cameras around",
         "FreeTimeGS++ 4D reconstruction",

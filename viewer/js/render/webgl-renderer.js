@@ -1,8 +1,9 @@
 // WebGL2 splat renderer. Splat attributes live in float textures laid out on a
 // near-square grid; a sorted index texture drives one instanced quad per splat,
-// composited back to front with premultiplied alpha.
+// composited back to front with premultiplied alpha, into a half-float target
+// where the browser can render to one.
 
-import { VERTEX, FRAGMENT, MAX_FOURIER } from './shaders.js';
+import { VERTEX, FRAGMENT, MAX_FOURIER, RESOLVE_VERTEX, RESOLVE_FRAGMENT } from './shaders.js';
 import { floatToHalfFast } from '../core/half.js';
 import { SH_C0 } from '../core/scene.js';
 import { transposeToColumnMajor } from '../core/camera.js';
@@ -11,7 +12,8 @@ import { ALPHA_CUT, EXT_STRIDE } from '../core/temporal-build.js';
 
 const UNIFORMS = ['uView', 'uViewport', 'uFocal', 'uPrincipal', 'uCamPos', 'uMaxRadius', 'uGrow', 'uRevealOrigin',
   'uRevealInvRadius', 'uRevealWidth', 'uT', 'uDuration', 'uShF', 'uShB', 'uShStride', 'uMotion', 'uStaticRule',
-  'uAlphaCut', 'uExt', 'uGroupCount', 'uTexWidth', 'uT0', 'uT1', 'uT2', 'uT3', 'uT4', 'uGroups', 'uTC', 'uOrder'];
+  'uAlphaCut', 'uAntialiased', 'uExt', 'uGroupCount', 'uTexWidth', 'uT0', 'uT1', 'uT2', 'uT3', 'uT4', 'uGroups', 'uTC',
+  'uOrder'];
 const BAND_TEXELS = 1 << 20;
 const BAND_STEPS = [16, 9, 4, 1];
 
@@ -61,14 +63,26 @@ export class WebGLSplatRenderer {
       gl.drawingBufferColorSpace = 'display-p3';
       r.colorSpace = gl.drawingBufferColorSpace;
     }
+    r.preferredColorSpace = r.colorSpace;
     return r;
+  }
+
+  // A scene with sRGB colours asks for an sRGB canvas: a display-p3 one shows
+  // them more saturated than they are.
+  setColorSpace(space) {
+    const gl = this.gl;
+    if (this.colorSpace === space || !('drawingBufferColorSpace' in gl)) return;
+    gl.drawingBufferColorSpace = space;
+    this.colorSpace = gl.drawingBufferColorSpace;
   }
 
   constructor(gl, canvas) {
     this.gl = gl;
     this.canvas = canvas;
     this.colorSpace = 'srgb';
+    this.preferredColorSpace = 'srgb';
     this.overdrawClamp = 1.5;
+    this.antialiased = true;
     this.contextLost = false;
     this.onContextRestored = null;
     this.onPoolLost = null;
@@ -132,6 +146,43 @@ export class WebGLSplatRenderer {
     this.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     this.maxLayers = gl.getParameter(gl.MAX_ARRAY_TEXTURE_LAYERS);
     this.dummy = this._tex2D(gl.RGBA32F, 1, 1);
+    // Half-float accumulation for the canvas, where the browser can render to it.
+    this.halfFloat = !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
+    this.accum = null;
+    if (this.halfFloat) {
+      const resolve = gl.createProgram();
+      gl.attachShader(resolve, compile(gl, gl.VERTEX_SHADER, RESOLVE_VERTEX));
+      gl.attachShader(resolve, compile(gl, gl.FRAGMENT_SHADER, RESOLVE_FRAGMENT));
+      gl.linkProgram(resolve);
+      this.resolve = resolve;
+      this.resolveU = { accum: gl.getUniformLocation(resolve, 'uAccum'), origin: gl.getUniformLocation(resolve, 'uOrigin') };
+    }
+  }
+
+  // The accumulation target for a viewport size, or null to draw straight into the canvas.
+  _accumTarget(w, h) {
+    const gl = this.gl;
+    if (!this.halfFloat) return null;
+    if (this.accum && this.accum.w === w && this.accum.h === h) return this.accum;
+    if (this.accum) {
+      gl.deleteFramebuffer(this.accum.fb);
+      gl.deleteTexture(this.accum.tex);
+    }
+    const tex = this._tex2D(gl.RGBA16F, w, h);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    const complete = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    if (!complete) {
+      gl.deleteFramebuffer(fb);
+      gl.deleteTexture(tex);
+      this.halfFloat = false;
+      this.accum = null;
+      return null;
+    }
+    this.accum = { fb, tex, w, h };
+    return this.accum;
   }
 
   async makeXRCompatible() {
@@ -488,8 +539,17 @@ export class WebGLSplatRenderer {
     const gl = this.gl;
     if (this.contextLost || !this.mode || !this.tex.order || this.drawCount === 0) return;
     this._syncGroups();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
-    gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+    // The canvas gets the splats through the half-float target; an XR framebuffer takes them directly.
+    const accum = framebuffer === null ? this._accumTarget(viewport.width, viewport.height) : null;
+    if (accum) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, accum.fb);
+      gl.viewport(0, 0, viewport.width, viewport.height);
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+    } else {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+      gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+    }
     gl.disable(gl.DEPTH_TEST);
     gl.disable(gl.CULL_FACE);
     gl.enable(gl.BLEND);
@@ -515,6 +575,7 @@ export class WebGLSplatRenderer {
     gl.uniform1i(u.uMotion, this.mode === 'temporal' ? 1 : 0);
     gl.uniform1i(u.uStaticRule, this.staticRule ? 1 : 0);
     gl.uniform1f(u.uAlphaCut, this.alphaCut);
+    gl.uniform1i(u.uAntialiased, this.antialiased === false ? 0 : 1);
     gl.uniform1i(u.uExt, this.hasExt ? 1 : 0);
     gl.uniform1i(u.uGroupCount, this.groupTrack ? this.groupTrack.count : 0);
     gl.uniform1i(u.uTexWidth, this.texWidth);
@@ -532,6 +593,22 @@ export class WebGLSplatRenderer {
     bind(6, gl.TEXTURE_2D, this.tex.t4 || this.dummy, u.uT4);
     bind(7, gl.TEXTURE_2D, this.tex.groups || this.dummy, u.uGroups);
     gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.drawCount);
+    gl.bindVertexArray(null);
+    if (accum) this._resolve(accum, viewport);
+  }
+
+  _resolve(accum, viewport) {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+    gl.disable(gl.BLEND);
+    gl.useProgram(this.resolve);
+    gl.bindVertexArray(this.vao);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, accum.tex);
+    gl.uniform1i(this.resolveU.accum, 0);
+    gl.uniform2i(this.resolveU.origin, viewport.x, viewport.y);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.bindVertexArray(null);
   }
 

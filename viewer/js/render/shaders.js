@@ -29,6 +29,7 @@ uniform int uShStride;       // layers per order in the colour texture
 uniform bool uMotion;
 uniform bool uStaticRule;    // nx4d: splats living longer than 0.6 T never fade
 uniform float uAlphaCut;     // source-specific visibility floor (>= 0.0016)
+uniform bool uAntialiased;   // opacity compensation of the low-pass (gsplat "antialiased"; off for "classic")
 uniform bool uExt;
 uniform int uGroupCount;
 uniform int uTexWidth;
@@ -118,32 +119,40 @@ void main() {
   mat3 VS = W * S * transpose(W);
 
   float iz = 1.0 / v.z;
-  float j00 = uFocal.x * iz, j02 = -uFocal.x * v.x * iz * iz;
-  float j11 = uFocal.y * iz, j12 = -uFocal.y * v.y * iz * iz;
+  // As in 3DGS and gsplat, the projection's slope is taken at most 1.3 half fields of view off axis, so splats
+  // beside the frustum are not stretched across the picture.
+  vec2 margin = 0.15 * uViewport / uFocal;
+  vec2 ray = clamp(v.xy * iz, -uPrincipal / uFocal - margin, (uViewport - uPrincipal) / uFocal + margin);
+  float j00 = uFocal.x * iz, j02 = -uFocal.x * ray.x * iz;
+  float j11 = uFocal.y * iz, j12 = -uFocal.y * ray.y * iz;
   float u0 = j00 * VS[0][0] + j02 * VS[2][0];
   float u1 = j00 * VS[0][1] + j02 * VS[2][1];
   float u2 = j00 * VS[0][2] + j02 * VS[2][2];
   float a0c = u0 * j00 + u2 * j02;
   float b = u1 * j11 + u2 * j12;
   float c0 = j11 * (j11 * VS[1][1] + j12 * VS[2][1]) + j12 * (j11 * VS[1][2] + j12 * VS[2][2]);
-  // 0.3 px² low-pass, with the opacity compensation the models are trained under.
+  // 0.3 px² low-pass, with the opacity compensation when the model was trained under it.
   float a = a0c + 0.3;
   float c = c0 + 0.3;
-  float comp = sqrt(max((a0c * c0 - b * b) / max(a * c - b * b, 1e-12), 2.5e-5));
+  float comp = uAntialiased ? sqrt(max((a0c * c0 - b * b) / max(a * c - b * b, 1e-12), 2.5e-5)) : 1.0;
+  // Drawn out to where it fades below 1/255, 3.33 sigma at most (gsplat's extent).
+  float peak = alpha * comp;
+  if (peak < 1.0 / 255.0) { cull(); return; }
+  float ext = min(3.33, sqrt(2.0 * log(peak * 255.0)));
   float mid = 0.5 * (a + c);
   float disc = sqrt(max(mid * mid - (a * c - b * b), 1e-9));
   float l1 = mid + disc;
   float l2 = max(mid - disc, 1e-9);
   vec2 e1 = abs(b) < 1e-9 ? (a >= c ? vec2(1.0, 0.0) : vec2(0.0, 1.0)) : normalize(vec2(b, l1 - a));
   vec2 e2 = vec2(-e1.y, e1.x);
-  float r1 = min(3.0 * sqrt(l1) * reveal, uMaxRadius);
-  float r2 = min(3.0 * sqrt(l2) * reveal, uMaxRadius);
+  float r1 = min(ext * sqrt(l1) * reveal, uMaxRadius);
+  float r2 = min(ext * sqrt(l2) * reveal, uMaxRadius);
 
   vec2 corner = vec2(float(gl_VertexID & 1) * 2.0 - 1.0, float(gl_VertexID >> 1) * 2.0 - 1.0);
   vec2 centre = vec2(uFocal.x * v.x * iz, uFocal.y * v.y * iz) + uPrincipal;
   vec2 px = centre + corner.x * r1 * e1 + corner.y * r2 * e2;
   gl_Position = vec4(px.x / uViewport.x * 2.0 - 1.0, 1.0 - px.y / uViewport.y * 2.0, 0.0, 1.0);
-  vLocal = corner * 3.0;
+  vLocal = corner * ext;
 
   // 4D spherindrical harmonics: c(d, t) = Σ_n Σ_b cos(2π n dt / T) Y_b(d) c_nb,
   // with d in the splat's own (rest) frame.
@@ -183,7 +192,8 @@ void main() {
       rgb += phi * Y[k] * texelFetch(uTC, ivec3(tc, n * uShStride + k), 0).rgb;
     }
   }
-  vColor = vec4(clamp(rgb + 0.5, 0.0, 1.0), alpha * comp);
+  // Only negative colour is clipped, as in 3DGS and gsplat; the framebuffer clips the sum.
+  vColor = vec4(max(rgb + 0.5, 0.0), peak);
 }
 `;
 
@@ -193,10 +203,27 @@ in vec2 vLocal;
 in vec4 vColor;
 out vec4 fragColor;
 void main() {
-  float r2 = dot(vLocal, vLocal);
-  if (r2 > 9.0) discard;
-  float alpha = vColor.a * exp(-0.5 * r2);
-  if (alpha < 0.0039) discard;
+  float alpha = min(0.999, vColor.a * exp(-0.5 * dot(vLocal, vLocal)));
+  if (alpha < 1.0 / 255.0) discard;
   fragColor = vec4(vColor.rgb * alpha, alpha);
+}
+`;
+
+// Copies the half-float accumulation target to the canvas: one rounding to 8
+// bits at the end instead of one per blended layer.
+export const RESOLVE_VERTEX = `#version 300 es
+void main() {
+  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+export const RESOLVE_FRAGMENT = `#version 300 es
+precision highp float;
+uniform highp sampler2D uAccum;
+uniform ivec2 uOrigin;
+out vec4 fragColor;
+void main() {
+  fragColor = texelFetch(uAccum, ivec2(gl_FragCoord.xy) - uOrigin, 0);
 }
 `;
