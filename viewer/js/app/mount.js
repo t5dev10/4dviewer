@@ -20,6 +20,7 @@ import { applyRendererPolicy, createQuality, QUALITY_TIERS, updateQuality } from
 import { dataBudget, dataTier, readEnvSignals, readTierEnvironment, resolveTier } from '../core/device-tier.js';
 import { encodeCam, parseDeepLink } from '../core/deeplink.js';
 import { subscribeFrames } from '../core/frame-driver.js';
+import { createFlyKeys } from '../core/fly-keys.js';
 import { runWorkerJob } from '../core/workers.js';
 import { validateFile } from '../core/validate.js';
 import { WebGLSplatRenderer } from '../render/webgl-renderer.js';
@@ -396,6 +397,7 @@ export function mountViewer(root, options = {}) {
   // --- frame loop ----------------------------------------------------------------------
 
   const inertia = { vYaw: 0, vPitch: 0, active: false, samples: [] };
+  const fly = createFlyKeys();
   const pointers = new Map();
   let pinchDist = 0;
   let lastTap = 0;
@@ -429,6 +431,10 @@ export function mountViewer(root, options = {}) {
       if (state.cam.yaw !== y0) inertia.vYaw = 0;
       if (state.cam.pitch !== p0) inertia.vPitch = 0;
       if (Math.hypot(inertia.vYaw, inertia.vPitch) < STOP_SPEED) stopInertia();
+    }
+    if (fly.moving) {
+      const dt = state.lastWall ? Math.min(100, now - state.lastWall) : 16.67;
+      fly.step(state.cam, frameView().viewWorld, sceneBounds().radius * state.cam.dolly, dt);
     }
     if (state.lastWall && state.lastFrameKey) updateQuality(quality, now, now - state.lastWall, sceneCount());
     if (state.grow < 1) {
@@ -616,6 +622,12 @@ export function mountViewer(root, options = {}) {
       markActive();
       const t = e.target;
       if ((t instanceof HTMLInputElement && t.type !== 'range' && t.type !== 'checkbox') || t instanceof HTMLSelectElement) return;
+      if (e.ctrlKey || e.metaKey || e.altKey) {
+        fly.clear();
+      } else if (fly.key(e.code, true, e.shiftKey)) {
+        e.preventDefault();
+        return;
+      }
       if (e.key === ' ') {
         e.preventDefault();
         if (state.kind === 'temporal') els.play.click();
@@ -630,10 +642,15 @@ export function mountViewer(root, options = {}) {
     for (const type of ['pointermove', 'pointerdown', 'wheel', 'touchstart']) {
       root.addEventListener(type, markActive, { passive: true, signal: aborter.signal });
     }
+    // Key releases count wherever focus went meanwhile.
+    const keyUp = (e) => fly.key(e.code, false, e.shiftKey);
+    addEventListener('keyup', keyUp);
+    listeners.push(['keyup', keyUp]);
     const reset = () => {
       pointers.clear();
       pinchDist = 0;
       stopInertia();
+      fly.clear();
     };
     for (const type of ['blur', 'pagehide']) {
       addEventListener(type, reset);
@@ -1321,6 +1338,9 @@ export function mountViewer(root, options = {}) {
   syncHud();
   attachPointer(els.gpu);
   attachKeys();
+  // On a site page the viewer is the page: take the keyboard so the keys work before a first click.
+  const doc = root.ownerDocument;
+  if (fromUrl && (!doc.activeElement || doc.activeElement === doc.body)) root.focus({ preventScroll: true });
   wireUi();
   const onResize = () => {
     root.classList.toggle('narrow', isNarrow());

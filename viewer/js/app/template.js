@@ -151,8 +151,9 @@ export const TEMPLATE = `
 
   <details class="section">
     <summary>Controls</summary>
-    <p class="hint desk">Drag: orbit · Scroll: zoom · Ctrl/⌘ or middle drag: pan · Alt/⌥ drag: yaw &amp; roll ·
-      Double-click or R: reset view · Space: play/pause · M: menu</p>
+    <p class="hint desk">Drag: orbit · Scroll: zoom · W A S D: move · E / Q: up / down · Shift: faster ·
+      Ctrl/⌘ or middle drag: pan · Alt/⌥ drag: yaw &amp; roll · Double-click or R: reset view · Space: play/pause ·
+      M: menu</p>
     <p class="hint touch">Drag: orbit · Pinch: zoom · Two-finger drag: pan · Double-tap: reset view</p>
   </details>
   <footer class="credit" data-el="credit"></footer>

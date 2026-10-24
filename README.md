@@ -91,7 +91,7 @@ The dev server answers byte ranges (for `.nxs4`) and falls back to `404.html` li
 | `perf=full` | Do not drop to the software-rasteriser performance mode |
 | `pool=N` | Streaming pool capacity in splats |
 
-Keys: Space play/pause · R reset view · M menu · Esc close menu.
+Keys: W/A/S/D move · E/Q up/down (Shift faster) · Space play/pause · R reset view · M menu · Esc close menu.
 
 ## Embedding
 
