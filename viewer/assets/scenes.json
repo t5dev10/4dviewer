@@ -88,6 +88,24 @@
       "group": "home",
       "limits": null,
       "cam": null
+    },
+    {
+      "id": "panoptic-basketball",
+      "name": "Basketball 360°",
+      "file": "panoptic-basketball.nxs4",
+      "format": "nxs4",
+      "sizeMB": 74.9,
+      "count": 487166,
+      "duration": 5,
+      "tags": [
+        "CMU Panoptic dome, 31 cameras around",
+        "FreeTimeGS++ 4D reconstruction",
+        "487,166 4D Gaussians, 5 s"
+      ],
+      "credit": "Basketball from the CMU Panoptic Studio dataset (Joo et al.), as prepared by Dynamic 3D Gaussians (Luiten et al., 3DV 2024); research use only. 4D reconstruction with FreeTimeGS++ (Lee et al., 2026; SNU VGI research licence) from 27 of the 31 dome cameras.",
+      "group": "home",
+      "limits": null,
+      "cam": null
     }
   ]
 }
