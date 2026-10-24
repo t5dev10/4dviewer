@@ -70,6 +70,24 @@
           0
         ]
       }
+    },
+    {
+      "id": "flame-steak",
+      "name": "Flame Steak",
+      "file": "flame-steak.nxs4",
+      "format": "nxs4",
+      "sizeMB": 60.7,
+      "count": 395232,
+      "duration": 10,
+      "tags": [
+        "Neural 3D Video (N3DV), 21 cameras",
+        "FreeTimeGS++ 4D reconstruction",
+        "395,232 4D Gaussians, 10 s"
+      ],
+      "credit": "Flame Steak from the Neural 3D Video dataset (Li et al., CVPR 2022; Meta; CC BY-NC 4.0). 4D reconstruction with FreeTimeGS++ (Lee et al., 2026; SNU VGI research licence) from 20 of its 21 cameras. Non-commercial use only.",
+      "group": "home",
+      "limits": null,
+      "cam": null
     }
   ]
 }

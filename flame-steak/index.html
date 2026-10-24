@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<script>
+  // This page answers at the site root and, as 404.html, at any /<scene> path:
+  // pin relative URLs to the site base (the repository path on *.github.io).
+  (function () {
+    var seg = location.pathname.split('/');
+    var base = location.hostname.endsWith('.github.io') && seg.length > 2 && seg[1] ? '/' + seg[1] + '/' : '/';
+    var b = document.createElement('base');
+    b.href = base;
+    document.head.appendChild(b);
+  })();
+</script>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Flame Steak · 4D Viewer</title>
+<meta name="description" content="395,232 splats · 10 s 4D clip — open it in your browser, orbit and scrub; nothing to install." />
+<meta property="og:title" content="Flame Steak · 4D Viewer" />
+<meta property="og:description" content="395,232 splats · 10 s 4D clip — open it in your browser, orbit and scrub; nothing to install." />
+<meta property="og:type" content="website" />
+<meta property="og:image" content="https://t5dev10.github.io/4dviewer/assets/og.jpg" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="theme-color" content="#08090c" />
+<meta name="color-scheme" content="dark" />
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml" />
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png" />
+<!-- Added to a home screen, the viewer opens edge to edge with no browser bars. -->
+<link rel="manifest" href="manifest.webmanifest" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="4D Viewer" />
+<style>
+  html, body { margin: 0; height: 100%; background: #08090c; overflow: hidden; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  #viewer { position: fixed; inset: 0; }
+  noscript { position: fixed; inset: 0; display: grid; place-items: center; color: #9aa4ae; font: 15px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<div id="viewer"></div>
+<noscript>This viewer needs JavaScript and WebGL2.</noscript>
+<script type="module">
+  import { mountViewer } from './viewer/js/index.js';
+  // /<scene>?t=…&cam=…&xf=… opens that scene at that moment and view.
+  window.__tg4dHandle = mountViewer(document.getElementById('viewer'), { fromUrl: true, route: true });
+</script>
+</body>
+</html>
